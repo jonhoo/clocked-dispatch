@@ -1,6 +1,8 @@
+# Clocked dispatch service in Rust
+
 [![Build Status](https://travis-ci.org/jonhoo/clocked-dispatch.svg?branch=master)](https://travis-ci.org/jonhoo/clocked-dispatch)
 
-# Clocked dispatch service in Rust
+[Documentation](https://jon.tsp.io/crates/clocked_dispatch)
 
 This Rust crate provides a clocked message dispatch service. Clocked
 dispatch is, at its heart, simply a set of channels. The difference is
