@@ -1,6 +1,13 @@
 [package]
 name = "clocked-dispatch"
 version = "0.1.0"
+
+description = "Provides a clocked message dispatch service"
+readme = "README.md"
+
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
 
-[dependencies]
+homepage = "https://github.com/jonhoo/clocked-dispatch"
+repository = "https://github.com/jonhoo/clocked-dispatch.git"
+
+keywords = ["channel","synchronization","dispatch","message"]
