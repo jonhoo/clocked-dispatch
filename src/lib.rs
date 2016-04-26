@@ -157,12 +157,12 @@ enum Message<T> {
 /// let (tx_a, rx_a) = m.new("atx", "arx");
 ///
 /// let tx_a1 = tx_a.clone("atx1");
-/// let a1 = thread::spawn(move || {
+/// thread::spawn(move || {
 ///     tx_a1.send("a1");
 /// });
 ///
 /// let tx_a2 = tx_a.clone("atx2");
-/// let a2 = thread::spawn(move || {
+/// thread::spawn(move || {
 ///     tx_a2.send("a2");
 /// });
 ///
