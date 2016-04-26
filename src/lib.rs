@@ -258,10 +258,11 @@ struct ReceiverInner<T> {
 /// been sent to another receiver under the same dispatcher.
 pub struct ClockedReceiver<T> {
     inner: Arc<ReceiverInner<T>>,
+    name: String,
 }
 
 impl<T> ClockedReceiver<T> {
-    fn new(bound: usize) -> ClockedReceiver<T> {
+    fn new<V: Into<String>>(name: V, bound: usize) -> ClockedReceiver<T> {
         ClockedReceiver {
             inner: Arc::new(ReceiverInner {
                 mx: Mutex::new(QueueState {
@@ -272,6 +273,7 @@ impl<T> ClockedReceiver<T> {
                 }),
                 cond: Condvar::new(),
             }),
+            name: name.into(),
         }
     }
 }
@@ -394,7 +396,7 @@ impl<T> Dispatcher<T> {
             target: target.clone(),
             serializer: self.serializer.clone(),
         };
-        let recv = ClockedReceiver::new(self.bound);
+        let recv = ClockedReceiver::new(target.clone(), self.bound);
 
         self.serializer.send(Message::NewReceiver(target.clone(), recv.inner.clone())).unwrap();
         self.serializer.send(Message::NewSender(target.clone(), source)).unwrap();
@@ -602,6 +604,86 @@ pub fn new<T: Send + 'static>(bound: usize) -> Dispatcher<T> {
         serializer: stx,
         bound: bound,
     }
+}
+
+/// Fuses together the output streams of multiple clocked receivers into another clocked stream.
+///
+/// This lets you wait for updates from many different senders, maintaining the guarantees of
+/// in-order, clocked delivery. Once all receivers managed by the fuse are up to date to some
+/// sequence number `x`, all messages with sequence number `<= x` will be delivered by the fuse
+/// output in order of their sequence numbers.
+///
+/// # Examples
+///
+/// Simple usage:
+///
+/// ```
+/// use clocked_dispatch;
+///
+/// let d = clocked_dispatch::new(10);
+/// let (tx1, rx1) = d.new("tx1", "rx1");
+/// let (tx2, rx2) = d.new("tx2", "rx2");
+///
+/// let fused = clocked_dispatch::fuse(vec![rx1, rx2], 10);
+///
+/// tx1.send("1");
+/// let rx1 = fused.recv().unwrap();
+///
+/// tx2.send("2");
+/// let rx2 = fused.recv().unwrap();
+///
+/// assert_eq!(rx1.0, Some("1"));
+/// assert_eq!(rx2.0, Some("2"));
+/// assert!(rx2.1 > rx1.1);
+/// ```
+///
+/// Clocked delivery:
+///
+/// ```
+/// use clocked_dispatch;
+///
+/// let d = clocked_dispatch::new(10);
+/// let (tx1, rx1) = d.new("tx1", "rx1");
+/// let (tx2, rx2) = d.new("tx2", "rx2");
+/// let (tx3, rx3) = d.new("tx3", "rx3");
+///
+/// // notice that rx3 is *not* fused
+/// let fused = clocked_dispatch::fuse(vec![rx1, rx2], 10);
+///
+/// tx3.send("3");
+/// assert_eq!(fused.recv().unwrap().0, None);
+///
+/// tx1.send("1");
+/// assert_eq!(fused.recv().unwrap().0, Some("1"));
+/// ```
+pub fn fuse<T: Send + 'static>(sources: Vec<ClockedReceiver<T>>,
+                               bound: usize)
+                               -> ClockedReceiver<T> {
+    let dispatch = new(bound);
+    let (dtx, drx) = dispatch.new("_unused_", "fuse_target");
+
+    // create all the senders
+    let mut dtxs = (0..sources.len())
+                       .into_iter()
+                       .map(|i| dtx.clone(sources[i].name.clone()))
+                       .collect::<Vec<_>>();
+
+    // base receiver no longer needed
+    drop(dtx);
+
+    // reverse since we pop below
+    dtxs.reverse();
+
+    for s in sources.into_iter() {
+        let tx = dtxs.pop().unwrap();
+        thread::spawn(move || {
+            for (m, ts) in s {
+                tx.forward(m, ts);
+            }
+        });
+    }
+
+    drx
 }
 
 #[cfg(test)]
