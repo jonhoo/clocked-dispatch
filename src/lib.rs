@@ -78,14 +78,18 @@
 //! let (_, rx_b) = m.new("btx1", "b");
 //!
 //! tx_a.send("a1");
-//! assert_eq!(rx_a.recv().unwrap(), (Some("a1"), 1));
-//! assert_eq!(rx_b.recv().unwrap(), (None, 1));
+//! let x = rx_a.recv().unwrap();
+//! assert_eq!(x.0, Some("a1"));
+//! assert_eq!(rx_b.recv().unwrap(), (None, x.1));
 //!
 //! tx_a.send("a2");
 //! tx_a.send("a3");
-//! assert_eq!(rx_a.recv().unwrap(), (Some("a2"), 2));
-//! assert_eq!(rx_a.recv().unwrap(), (Some("a3"), 3));
-//! assert_eq!(rx_b.recv().unwrap(), (None, 3));
+//!
+//! assert_eq!(rx_a.recv().unwrap().0, Some("a2"));
+//!
+//! let x = rx_a.recv().unwrap();
+//! assert_eq!(x.0, Some("a3"));
+//! assert_eq!(rx_b.recv().unwrap(), (None, x.1));
 //! ```
 //!
 //! In-order delivery
@@ -104,6 +108,8 @@
 //! tx2.forward(None, 1);
 //! assert_eq!(rx.recv(), Ok((Some("a1"), 1)));
 //! ```
+
+extern crate time;
 
 use std::sync::{Arc, Mutex, Condvar};
 use std::cmp::Ordering;
@@ -436,7 +442,6 @@ struct DispatchInner<T> {
     targets: HashMap<String, Target<T>>,
     forwarding: Option<bool>,
     bound: usize,
-    gts: usize,
 }
 
 impl<T> DispatchInner<T> {
@@ -494,9 +499,7 @@ impl<T> DispatchInner<T> {
                     self.forwarding = Some(td.ts.is_some())
                 }
 
-                let ts = td.ts.unwrap_or(self.gts);
-                self.gts = ts + 1;
-
+                let ts = td.ts.unwrap_or(time::precise_time_ns() as usize);
                 let min = *self.targets[&*td.to].freshness.values().min().unwrap();
                 if ts <= min || td.ts.is_none() {
                     // this update doesn't need to be delayed
@@ -587,7 +590,6 @@ pub fn new<T: Send + 'static>(bound: usize) -> Dispatcher<T> {
         targets: HashMap::new(),
         forwarding: None,
         bound: bound,
-        gts: 1,
     };
 
     thread::spawn(move || {
