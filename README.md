@@ -52,6 +52,13 @@ updates will not block the dispatcher. This means that `s1.send(v)` will
 not block even though `r2` is not currently reading from its input
 channel.
 
+Clocked dispatch instances can be composed by using `forward` instead of
+`send` for messages that have already been assigned a sequence number.
+The library ensures that such messages are delivered in-order, by
+delaying the delivery of messages until it can guarantee that no earlier
+messages will later arrive. See the crate documentation for details
+about this mode of operation.
+
 ## License
 
 Licensed under either of
