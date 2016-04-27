@@ -291,6 +291,10 @@ impl<T: Clone> ClockedSender<T> {
 /// Note that the existence of a `ClockedBroadcater` prevents the closing of any clocked channels
 /// managed by this dispatcher.
 ///
+/// # Examples
+///
+/// Regular broadcast:
+///
 /// ```
 /// use clocked_dispatch;
 /// use std::sync::mpsc;
@@ -302,9 +306,46 @@ impl<T: Clone> ClockedSender<T> {
 /// // even though all A senders have been dropped.
 ///
 /// let (tx_b, rx_b) = m.new("btx", "brx");
+///
+/// tx.broadcast("1");
+///
+/// let x = rx_a.recv().unwrap();
+/// assert_eq!(x.0, Some("1"));
+/// assert_eq!(rx_b.recv(), Ok(x));
+///
+/// // non-broadcasts still work
+/// tx_b.send("2");
+/// let x = rx_b.recv().unwrap();
+/// assert_eq!(x.0, Some("2"));
+/// assert_eq!(rx_a.recv(), Ok((None, x.1)));
+///
+/// // drop broadcaster
+/// drop(tx);
+///
+/// // A is now closed because there are no more senders
+/// assert_eq!(rx_a.recv(), Err(mpsc::RecvError));
+///
+/// // rx_b is *not* closed because tx_b still exists
+/// assert_eq!(rx_b.try_recv(), Err(mpsc::TryRecvError::Empty));
+///
+/// drop(tx_b);
+/// // rx_b is now closed because its senders have all gone away
+/// assert_eq!(rx_b.recv(), Err(mpsc::RecvError));
+/// ```
+///
+/// Forwarding broadcast:
+///
+/// ```
+/// use clocked_dispatch;
+/// use std::sync::mpsc;
+///
+/// let m = clocked_dispatch::new(10);
+/// let (tx_a, rx_a) = m.new("atx", "arx");
+/// let (tx_b, rx_b) = m.new("btx", "brx");
 /// let (tx_c, rx_c) = m.new("ctx", "crx");
 ///
-/// tx.broadcast(Some("1"), 1);
+/// let tx = tx_a.to_broadcaster();
+/// tx.broadcast_forward(Some("1"), 1);
 ///
 /// // all inputs aren't yet up-to-date to 1
 /// assert_eq!(rx_a.try_recv(), Err(mpsc::TryRecvError::Empty));
@@ -319,23 +360,12 @@ impl<T: Clone> ClockedSender<T> {
 /// assert_eq!(rx_c.recv().unwrap(), (Some("1"), 1));
 ///
 /// // non-broadcasts still work (we still need to keep inputs up-to-date)
-/// tx.broadcast(None, 2);
+/// tx.broadcast_forward(None, 2);
 /// tx_b.forward(None, 2);
 /// tx_c.forward(Some("c"), 2);
 /// assert_eq!(rx_a.recv().unwrap(), (None, 2));
 /// assert_eq!(rx_b.recv().unwrap(), (None, 2));
 /// assert_eq!(rx_c.recv().unwrap(), (Some("c"), 2));
-///
-/// drop(tx);
-/// // A is now closed because there are no more senders
-/// assert_eq!(rx_a.recv(), Err(mpsc::RecvError));
-///
-/// // rx_b is *not* closed because tx_b still exists
-/// assert_eq!(rx_b.try_recv(), Err(mpsc::TryRecvError::Empty));
-///
-/// drop(tx_b);
-/// // rx_b is now closed because its senders have all gone away
-/// assert_eq!(rx_b.recv(), Err(mpsc::RecvError));
 /// ```
 pub struct ClockedBroadcaster<T: Clone> {
     source: String,
@@ -349,6 +379,27 @@ impl<T: Clone> Drop for ClockedBroadcaster<T> {
 }
 
 impl<T: Clone> ClockedBroadcaster<T> {
+    /// Sends a value to all receivers known to this dispatcher. The value will be assigned a
+    /// sequence number by the dispatcher.
+    ///
+    /// This function will *block* until space in the internal buffer becomes available, or a
+    /// receiver is available to hand off the message to.
+    ///
+    /// Note that a successful send does *not* guarantee that the receiver will ever see the data if
+    /// there is a buffer on this channel. Items may be enqueued in the internal buffer for the
+    /// receiver to receive at a later time. If the buffer size is 0, however, it can be guaranteed
+    /// that the receiver has indeed received the data if this function returns success.
+    pub fn broadcast(&self, data: T) {
+        self.dispatcher
+            .send(Message::Data(TaggedData {
+                from: self.source.clone(),
+                to: None,
+                ts: None,
+                data: Some(data),
+            }))
+            .unwrap()
+    }
+
     /// Sends an already-sequenced value to all receivers known to this dispatcher. The message may
     /// be buffered by the dispatcher until it can guarantee that no other sender will later try to
     /// send messages with a lower sequence number.
@@ -364,7 +415,7 @@ impl<T: Clone> ClockedBroadcaster<T> {
     /// It is optional to include data when forwarding. If no data is included, this message
     /// conveys to the dispatcher that this sender promises not to send later messages with a
     /// higher sequence number than the one given.
-    pub fn broadcast(&self, data: Option<T>, ts: usize) {
+    pub fn broadcast_forward(&self, data: Option<T>, ts: usize) {
         self.dispatcher
             .send(Message::Data(TaggedData {
                 from: self.source.clone(),
@@ -657,6 +708,7 @@ impl<T: Clone> DispatchInner<T> {
                         state = t.channel.cond.wait(state).unwrap();
                     }
 
+                    // TODO: avoid clone() for the last send
                     state.queue.push_back((data.clone().unwrap(), ts));
                 }
             }
