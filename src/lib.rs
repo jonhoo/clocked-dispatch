@@ -256,6 +256,11 @@ impl<T> ClockedSender<T> {
 }
 
 impl<T: Clone> ClockedSender<T> {
+    /// Converts this sender into a broadcast sender.
+    ///
+    /// Doing so detaches the sender from its receiver, and means all future sends will be
+    /// broadcast to all receivers. Note that the existence of a broadcaster prevents the closing
+    /// of all channels.
     pub fn to_broadcaster(self) -> ClockedBroadcaster<T> {
         let dispatcher = self.dispatcher.clone();
         let source = format!("{}_bcast", self.source);
@@ -269,8 +274,9 @@ impl<T: Clone> ClockedSender<T> {
     }
 }
 
-/// A sending half of a clocked synchronous channel that only allows broadcast.
-/// This half can only be owned by one thread, but it can be cloned to send to other threads.
+/// A sending half of a clocked synchronous channel that only allows broadcast. This half can only
+/// be owned by one thread, but it can be cloned to send to other threads. A `ClockedBroadcaster`
+/// can be constructed from a `ClockedSender` using `ClockedSender::to_broadcaster`.
 ///
 /// Sending on a clocked channel will deliver the given message to the appropriate receiver, but
 /// also notify all other receivers about the timestamp assigned to the message. The sending will
