@@ -76,8 +76,8 @@
 //! let m = clocked_dispatch::new(10);
 //! let (tx_a, rx_a) = m.new("atx1", "a");
 //!
-//! // notice that we can't use _ here even though tx_b is unused
-//! // because then tx_b would be dropped, causing rx_b to be closed
+//! // notice that we can't use _ here even though tx_b is unused because
+//! // then tx_b would be dropped, causing rx_b to be closed immediately
 //! let (tx_b, rx_b) = m.new("btx1", "b");
 //! let _ = tx_b;
 //!
@@ -140,9 +140,10 @@ struct TaggedData<T> {
 /// A message intended for the dispatcher.
 enum Message<T> {
     Data(TaggedData<T>),
-    NewReceiver(String, Arc<ReceiverInner<T>>),
-    NewSender(Option<String>, String),
-    Leave(Option<String>, String),
+    ReceiverJoin(String, Arc<ReceiverInner<T>>),
+    ReceiverLeave(String),
+    SenderJoin(Option<String>, String),
+    SenderLeave(Option<String>, String),
 }
 
 /// The sending half of a clocked synchronous channel.
@@ -190,7 +191,7 @@ pub struct ClockedSender<T> {
 impl<T> Drop for ClockedSender<T> {
     fn drop(&mut self) {
         self.dispatcher
-            .send(Message::Leave(Some(self.target.clone()), self.source.clone()))
+            .send(Message::SenderLeave(Some(self.target.clone()), self.source.clone()))
             .unwrap();
     }
 }
@@ -245,7 +246,7 @@ impl<T> ClockedSender<T> {
     pub fn clone<V: Into<String>>(&self, source: V) -> ClockedSender<T> {
         let source = source.into();
         self.dispatcher
-            .send(Message::NewSender(Some(self.target.clone()), source.clone()))
+            .send(Message::SenderJoin(Some(self.target.clone()), source.clone()))
             .unwrap();
         ClockedSender {
             source: source,
@@ -264,9 +265,9 @@ impl<T: Clone> ClockedSender<T> {
     pub fn to_broadcaster(self) -> ClockedBroadcaster<T> {
         let dispatcher = self.dispatcher.clone();
         let source = format!("{}_bcast", self.source);
-        dispatcher.send(Message::NewSender(None, source.clone())).unwrap();
+        dispatcher.send(Message::SenderJoin(None, source.clone())).unwrap();
 
-        // NOTE: the drop of self causes a Message::Leave to be sent for this sender
+        // NOTE: the drop of self causes a Message::SenderLeave to be sent for this sender
         ClockedBroadcaster {
             source: source,
             dispatcher: dispatcher,
@@ -343,7 +344,7 @@ pub struct ClockedBroadcaster<T: Clone> {
 
 impl<T: Clone> Drop for ClockedBroadcaster<T> {
     fn drop(&mut self) {
-        self.dispatcher.send(Message::Leave(None, self.source.clone())).unwrap();
+        self.dispatcher.send(Message::SenderLeave(None, self.source.clone())).unwrap();
     }
 }
 
@@ -380,7 +381,7 @@ impl<T: Clone> ClockedBroadcaster<T> {
     /// of the senders can be tracked reliably.
     pub fn clone<V: Into<String>>(&self, source: V) -> ClockedBroadcaster<T> {
         let source = source.into();
-        self.dispatcher.send(Message::NewSender(None, source.clone())).unwrap();
+        self.dispatcher.send(Message::SenderJoin(None, source.clone())).unwrap();
         ClockedBroadcaster {
             source: source,
             dispatcher: self.dispatcher.clone(),
@@ -405,14 +406,19 @@ struct ReceiverInner<T> {
 /// A clocked receiver will receive all messages sent by one of its associated senders. It will
 /// also receive notifications whenever a message with a higher timestamp than any it has seen has
 /// been sent to another receiver under the same dispatcher.
-pub struct ClockedReceiver<T> {
+pub struct ClockedReceiver<T: Send + 'static> {
+    dispatcher: mpsc::SyncSender<Message<T>>,
     inner: Arc<ReceiverInner<T>>,
     name: String,
 }
 
-impl<T> ClockedReceiver<T> {
-    fn new<V: Into<String>>(name: V, bound: usize) -> ClockedReceiver<T> {
+impl<T: Send + 'static> ClockedReceiver<T> {
+    fn new<V: Into<String>>(name: V,
+                            dispatcher: mpsc::SyncSender<Message<T>>,
+                            bound: usize)
+                            -> ClockedReceiver<T> {
         ClockedReceiver {
+            dispatcher: dispatcher,
             inner: Arc::new(ReceiverInner {
                 mx: Mutex::new(QueueState {
                     queue: VecDeque::with_capacity(bound),
@@ -427,21 +433,32 @@ impl<T> ClockedReceiver<T> {
     }
 }
 
-impl<T> Iterator for ClockedReceiver<T> {
+impl<T: Send + 'static> Iterator for ClockedReceiver<T> {
     type Item = (Option<T>, usize);
     fn next(&mut self) -> Option<Self::Item> {
         self.recv().ok()
     }
 }
 
-// TODO
-// impl<T> Drop for ClockedReceiver<T> {
-//     fn drop(&mut self) {
-//         // ensure that subsequent send()'s return an error (somehow?)
-//     }
-// }
+impl<T: Send + 'static> Drop for ClockedReceiver<T> {
+    fn drop(&mut self) {
+        use std::mem;
 
-impl<T> ClockedReceiver<T> {
+        let name = mem::replace(&mut self.name, String::new());
+        let dp = self.dispatcher.clone();
+        thread::spawn(move || {
+            dp.send(Message::ReceiverLeave(name)).unwrap();
+        });
+
+        // we're dropping the receiver, but the dispatcher might be blocked trying to send us
+        // something. we therefore need to keep reading until the dispatcher actually gets around
+        // to closing the channel. this can be done in a separate thread to let the drop finish
+        // though, since there's no reason to make the caller wait for this to happen (I think).
+        self.count(); // count will iterate on the channel until it's closed
+    }
+}
+
+impl<T: Send + 'static> ClockedReceiver<T> {
     /// Attempts to wait for a value on this receiver, returning an error if the corresponding
     /// channel has hung up.
     ///
@@ -515,12 +532,12 @@ impl<T> ClockedReceiver<T> {
 }
 
 /// Dispatch coordinator for adding additional clocked channels.
-pub struct Dispatcher<T> {
+pub struct Dispatcher<T: Send> {
     dispatcher: mpsc::SyncSender<Message<T>>,
     bound: usize,
 }
 
-impl<T> Dispatcher<T> {
+impl<T: Send> Dispatcher<T> {
     /// Creates a new named, synchronous, bounded, clocked channel managed by this dispatcher.
     ///
     /// The given receiver and sender names *must* be unique for this dispatch.
@@ -545,10 +562,10 @@ impl<T> Dispatcher<T> {
             target: target.clone(),
             dispatcher: self.dispatcher.clone(),
         };
-        let recv = ClockedReceiver::new(target.clone(), self.bound);
+        let recv = ClockedReceiver::new(target.clone(), self.dispatcher.clone(), self.bound);
 
-        self.dispatcher.send(Message::NewReceiver(target.clone(), recv.inner.clone())).unwrap();
-        self.dispatcher.send(Message::NewSender(Some(target.clone()), source)).unwrap();
+        self.dispatcher.send(Message::ReceiverJoin(target.clone(), recv.inner.clone())).unwrap();
+        self.dispatcher.send(Message::SenderJoin(Some(target.clone()), source)).unwrap();
         (send, recv)
     }
 }
@@ -631,8 +648,6 @@ impl<T: Clone> DispatchInner<T> {
     /// If `data == None`, `ts` is sent all receivers.
     /// If `to == None`, `data.unwrap()` is sent to all receivers.
     /// If `to == Some(t)`, `data.unwrap()` is sent to the the receiver named `t`.
-    ///
-    /// Panics if `data` and `to` is given, but the intended recipient does not exist.
     fn notify(&self, to: Option<&String>, ts: usize, data: Option<T>) {
         for (tn, t) in self.targets.iter() {
             let mut state = t.channel.mx.lock().unwrap();
@@ -650,14 +665,14 @@ impl<T: Clone> DispatchInner<T> {
             drop(state);
         }
 
-        if data.is_some() && to.is_some() && !self.targets.contains_key(to.unwrap().as_str()) {
-            panic!("tried to dispatch to unknown recipient '{}'", to.unwrap());
-        }
+        // if data.is_some() && to.is_some() && !self.targets.contains_key(to.unwrap().as_str())
+        // this seems like a bad case, but it could just be that the receiver has left
+        // TODO: would be nice if we had some way of notifying the sender that this is the case
     }
 
     /// Finds the minimum sequence number across all senders.
     fn min(&self) -> usize {
-        *self.freshness.values().min().expect("either broadcasters or senders must exist")
+        self.freshness.values().min().and_then(|m| Some(*m)).unwrap_or(usize::max_value() - 1)
     }
 
     /// Should be called whenever the set of senders changes to process.
@@ -702,19 +717,21 @@ impl<T: Clone> DispatchInner<T> {
             // 1. finding the smallest in `bdelay`
             let next = self.bdelay.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1);
             if let Some(to) = to {
-                // 2. finding the smallest in `targets[to].delayed`
-                let tnext = self.targets[to.as_str()]
-                                .delayed
-                                .peek()
-                                .and_then(|d| Some(d.ts))
-                                .unwrap_or(min + 1);
+                if self.targets.contains_key(to.as_str()) {
+                    // 2. finding the smallest in `targets[to].delayed`
+                    let tnext = self.targets[to.as_str()]
+                                    .delayed
+                                    .peek()
+                                    .and_then(|d| Some(d.ts))
+                                    .unwrap_or(min + 1);
 
-                // 3. using the message from 2 if it is the earliest (and early enough)
-                if tnext < next && tnext <= min {
-                    let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
-                    forwarded = d.ts;
-                    self.notify(Some(to), d.ts, Some(d.data));
-                    continue;
+                    // 3. using the message from 2 if it is the earliest (and early enough)
+                    if tnext < next && tnext <= min {
+                        let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
+                        forwarded = d.ts;
+                        self.notify(Some(to), d.ts, Some(d.data));
+                        continue;
+                    }
                 }
             }
 
@@ -796,7 +813,7 @@ impl<T: Clone> DispatchInner<T> {
                     }
                 }
             }
-            Message::NewReceiver(name, inner) => {
+            Message::ReceiverJoin(name, inner) => {
                 self.targets.insert(name.clone(),
                                     Target {
                                         channel: inner,
@@ -805,7 +822,32 @@ impl<T: Clone> DispatchInner<T> {
                                     });
                 self.destinations.insert(name);
             }
-            Message::NewSender(target, source) => {
+            Message::ReceiverLeave(name) => {
+                // Close the channel (to allow the receiver cleanup to complete)
+                {
+                    // scope to end immutable borrow of self.targets
+                    let t = &self.targets[&*name];
+                    let mut state = t.channel.mx.lock().unwrap();
+                    state.closed = true;
+                    t.channel.cond.notify_one();
+                    drop(state);
+                }
+
+                // Deregister all senders (so they don't hold up due to freshness)
+                {
+                    for s in self.targets[&*name].senders.iter() {
+                        self.freshness.remove(s.as_str());
+                    }
+                }
+
+                // Deregister the receiver
+                self.targets.remove(&*name);
+                self.destinations.remove(&*name);
+
+                // TODO: ensure that subsequent send()'s return an error (somehow?) instead of just
+                // crashing and burning (panic) like what happens now.
+            }
+            Message::SenderJoin(target, source) => {
                 self.freshness.insert(source.clone(), 0);
                 if let Some(target) = target {
                     self.targets.get_mut(&*target).unwrap().senders.insert(source);
@@ -813,13 +855,12 @@ impl<T: Clone> DispatchInner<T> {
                     self.broadcasters.insert(source);
                 }
             }
-            Message::Leave(target, source) => {
+            Message::SenderLeave(target, source) => {
                 if let Some(ref target) = target {
-                    self.targets
-                        .get_mut(target.as_str())
-                        .expect(&format!("tried to remove unknown receiver '{}'", target))
-                        .senders
-                        .remove(&*source);
+                    // NOTE: target may not exist because receiver has left
+                    if let Some(target) = self.targets.get_mut(target.as_str()) {
+                        target.senders.remove(&*source);
+                    }
                 } else {
                     self.broadcasters.remove(&*source);
                 }
@@ -948,4 +989,44 @@ pub fn fuse<T: Clone + Send + 'static>(sources: Vec<ClockedReceiver<T>>,
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    #[test]
+    fn can_send_after_recv_drop() {
+        // Create a dispatcher
+        let d = super::new(1);
+
+        // Create two channels
+        let (tx_a, rx_a) = d.new("atx", "arx");
+        let (tx_b, rx_b) = d.new("btx", "brx");
+        let _ = tx_a;
+
+        // Drop a receiver
+        drop(rx_a);
+
+        // Ensure that sending doesn't block forever
+        tx_b.send(10);
+
+        // And that messages are still delivered
+        assert_eq!(rx_b.recv().unwrap().0.unwrap(), 10);
+    }
+
+    #[test]
+    fn can_forward_after_recv_drop() {
+        // Create a dispatcher
+        let d = super::new(1);
+
+        // Create two channels
+        let (tx_a, rx_a) = d.new("atx", "arx");
+        let (tx_b, rx_b) = d.new("btx", "brx");
+        let _ = tx_a;
+
+        // Drop a receiver
+        drop(rx_a);
+
+        // Ensure that forwarding doesn't block forever
+        tx_b.forward(Some(10), 1);
+
+        // And that messages are still delivered
+        assert_eq!(rx_b.recv(), Ok((Some(10), 1)));
+    }
+}
