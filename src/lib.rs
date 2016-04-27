@@ -578,8 +578,11 @@ impl<T> Ord for Delayed<T> {
 }
 
 struct Target<T> {
+    // the receiver's channel
     channel: Arc<ReceiverInner<T>>,
+    // messages for this receiver that have high timestamps, and must be delayed
     delayed: BinaryHeap<Delayed<T>>,
+    // known senders for this receiver
     senders: HashSet<String>,
 }
 
@@ -595,16 +598,35 @@ struct Target<T> {
 // dispatcher in another mode. Another potentially good example of this is forcing T: Clone only
 // for broadcast dispatchers.
 struct DispatchInner<T> {
+    // per-receiver information
     targets: HashMap<String, Target<T>>,
+    // per-sender information
     freshness: HashMap<String, usize>,
+    // essentially targets.keys()
+    // kept separate so we can mutably use targets while iterating over all receiver names
     destinations: HashSet<String>,
+    // known broadcasters
     broadcasters: HashSet<String>,
+    // broadcast messages that have high timestamps, and must be delayed
     bdelay: BinaryHeap<Delayed<T>>,
+    // whether we are operating in forwarding or serializing mode
+    // in the former, the senders assign timestamps
+    // in the latter, we assign the timestamps
+    // the first message we receive dictate the mode
     forwarding: Option<bool>,
+    // queue bound
     bound: usize,
 }
 
 impl<T: Clone> DispatchInner<T> {
+    /// Notifies all receivers of the given timestamp, and sends any given data to the intended
+    /// recipients.
+    ///
+    /// If `data == None`, `ts` is sent all receivers.
+    /// If `to == None`, `data.unwrap()` is sent to all receivers.
+    /// If `to == Some(t)`, `data.unwrap()` is sent to the the receiver named `t`.
+    ///
+    /// Panics if `data` and `to` is given, but the intended recipient does not exist.
     fn notify(&self, to: Option<&String>, ts: usize, data: Option<T>) {
         for (tn, t) in self.targets.iter() {
             let mut state = t.channel.mx.lock().unwrap();
@@ -627,18 +649,26 @@ impl<T: Clone> DispatchInner<T> {
         }
     }
 
+    /// Finds the minimum sequence number across all senders.
     fn min(&self) -> usize {
         *self.freshness.values().min().expect("either broadcasters or senders must exist")
     }
 
+    /// Should be called whenever the set of senders changes to process.
+    /// Processes delayed messages that can now be delivered, and closes channels with no senders.
     fn senders_changed(&mut self, to: Option<String>) {
+        // if the removed sender has been delaying delivery of messages (by virtue of being the
+        // sender with the lowest sequence number), we may now be able to send some more messages.
+        // this can only happen if we're in forwarding mode, because in assignment mode, senders
+        // don't have a way to not be up-to-date, and so there are no delayed messages.
         if let Some(true) = self.forwarding {
-            // the removed sender may have been what has delayed some things
             self.process_delayed(to.as_ref());
         }
 
         if self.broadcasters.is_empty() {
+            // if there are broadcasters, no channel is closed
             for (_, t) in self.targets.iter_mut().filter(|&(_, ref t)| t.senders.is_empty()) {
+                // having no senders when there are no broadcasters means the channel is closed
                 let mut state = t.channel.mx.lock().unwrap();
                 state.closed = true;
                 t.channel.cond.notify_one();
@@ -647,18 +677,33 @@ impl<T: Clone> DispatchInner<T> {
         }
     }
 
+    /// Find any delayed messages that are now earlier than the minimum sender sequence number, and
+    /// send them in-order. Will check both broadcast messages and messages to a given sender if
+    /// `to.is_some()`.
     fn process_delayed(&mut self, to: Option<&String>) {
         let min = self.min();
+
+        // keep track of the largest timestamp we notified receivers about
+        // so that we also know to update their up-to-date-ness if the min
+        // is greater than all queued messages' sequence numbers.
         let mut forwarded = 0;
+
+        // keep looking for a candidate to send
         loop {
+            // we need to find the message in `[bdelay + targets[to].delayed]` with the lowest
+            // timestamp. we do this by:
+            //
+            // 1. finding the smallest in `bdelay`
             let next = self.bdelay.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1);
             if let Some(to) = to {
+                // 2. finding the smallest in `targets[to].delayed`
                 let tnext = self.targets[to.as_str()]
                                 .delayed
                                 .peek()
                                 .and_then(|d| Some(d.ts))
                                 .unwrap_or(min + 1);
 
+                // 3. using the message from 2 if it is the earliest (and early enough)
                 if tnext < next && tnext <= min {
                     let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
                     forwarded = d.ts;
@@ -666,21 +711,34 @@ impl<T: Clone> DispatchInner<T> {
                     continue;
                 }
             }
-            if next > min {
-                break;
+
+            // 4. using the message from 1 (which must now be the earliest) if it is early enough
+            if next <= min {
+                let d = self.bdelay.pop().unwrap();
+                forwarded = d.ts;
+                self.notify(None, d.ts, Some(d.data));
+                continue;
             }
 
-            let d = self.bdelay.pop().unwrap();
-            forwarded = d.ts;
-            self.notify(None, d.ts, Some(d.data));
+            // no delayed message has a sequence number <= min
+            break;
         }
 
+        // make sure all dependents know how up-to-date we are
+        // even if we didn't send a delayed message for the min
         if forwarded < min {
-            // make sure all dependents know we're at least this up to date
             self.notify(None, min, None);
         }
     }
 
+    /// Takes a message from any sender, handles control messages, and delays or delivers data
+    /// messages.
+    ///
+    /// The first data message sets which mode the dispatcher operates in. If the first message has
+    /// a sequence number, the dispatcher will operate in forwarding mode. If it does not, it will
+    /// operate in assignment mode. In the former, it expects every data message to be numbered,
+    /// and delays too-new messages until all inputs are at least that up-to-date. In the latter,
+    /// it will deliver all messages immediately, and will assign sequence numbers to each one.
     fn absorb(&mut self, m: Message<T>) {
         match m {
             Message::Data(td) => {
@@ -759,8 +817,8 @@ impl<T: Clone> DispatchInner<T> {
                 } else {
                     self.broadcasters.remove(&*source);
                 }
-                self.freshness.remove(&*source);
 
+                self.freshness.remove(&*source);
                 self.senders_changed(target);
             }
         }
