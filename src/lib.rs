@@ -1079,7 +1079,7 @@ pub fn fuse<T: Clone + Send + 'static>(sources: Vec<ClockedReceiver<T>>,
     // create all the senders
     let mut dtxs = (0..sources.len())
                        .into_iter()
-                       .map(|i| dtx.clone(sources[i].name.clone()))
+                       .map(|i| dtx.clone(format!("{}_to_fuse_{}", sources[i].name, i)))
                        .collect::<Vec<_>>();
 
     // base receiver no longer needed
