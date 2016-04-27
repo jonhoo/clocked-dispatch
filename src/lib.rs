@@ -1300,16 +1300,18 @@ mod tests {
         let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
             if ts % 2 == 0 {
                 tx.broadcast_forward(None, ts);
-                return;
+            } else {
+                tx.broadcast_forward(x, ts);
             }
-            tx.broadcast_forward(x, ts);
         };
         let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            if ts % 2 == 0 {
+            // note that % is different so that there will be some timestamps where one drops, but
+            // the other does not.
+            if ts % 3 == 0 {
                 tx.broadcast_forward(None, ts);
-                return;
+            } else {
+                tx.broadcast_forward(x, ts);
             }
-            tx.broadcast_forward(x, ts);
         };
 
         let (a_in, b_in, c_in) = fused_setup(a, b);
@@ -1327,10 +1329,15 @@ mod tests {
         let mut old = 0;
         for (c, ts) in c_in {
             assert!(ts > old);
-            if ts % 2 == 0 {
+            if ts % 2 == 0 && ts % 3 == 0 {
+                // both dropped, so must be None
                 assert!(c.is_none());
-            } else {
-                assert!(c.is_some());
+            } else if ts % 2 == 0 {
+                // a would have dropped an ax
+                assert!(c.is_none() || c.unwrap() == "bx");
+            } else if ts % 3 == 0 {
+                // b would have dropped a bx
+                assert!(c.is_none() || c.unwrap() == "ax");
             }
             old = ts;
         }
