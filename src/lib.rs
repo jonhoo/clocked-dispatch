@@ -536,14 +536,11 @@ impl<T: Send + 'static> ClockedReceiver<T> {
     /// before the disconnect will still be properly received.
     pub fn recv(&self) -> Result<(Option<T>, usize), mpsc::RecvError> {
         let mut state = self.inner.mx.lock().unwrap();
-        while state.ts_head == state.ts_tail && !state.closed {
-            // we have observed all timestamps, so the queue must be empty
+        while state.ts_head == state.ts_tail && state.queue.is_empty() && !state.closed {
+            // NOTE: is is *not* sufficient to use head == tail as an indicator that there are no
+            // messages. specifically, if there are duplicates for a given timestamp, the equality
+            // may work out while there are still elements in the queue.
             state = self.inner.cond.wait(state).unwrap();
-        }
-
-        if state.ts_head == state.ts_tail {
-            // we must be closed
-            return Err(mpsc::RecvError);
         }
 
         // if there's something at the head of the queue, return it
@@ -551,6 +548,11 @@ impl<T: Send + 'static> ClockedReceiver<T> {
             state.ts_head = ts;
             self.inner.cond.notify_one();
             return Ok((Some(t), ts));
+        }
+
+        if state.ts_head == state.ts_tail {
+            // we must be closed
+            return Err(mpsc::RecvError);
         }
 
         // otherwise, notify about the newest available timestamp
@@ -1145,6 +1147,23 @@ mod tests {
         // And that no more entries are sent
         assert_eq!(rx_a.recv(), Err(mpsc::RecvError));
         assert_eq!(rx_b.recv(), Err(mpsc::RecvError));
+    }
+
+    #[test]
+    fn broadcast_dupe_termination() {
+        use std::sync::mpsc;
+
+        let d = super::new(1);
+        let (tx, rx) = d.new("tx", "rx");
+        let tx = tx.to_broadcaster();
+
+        tx.broadcast_forward(Some("a"), 10);
+        tx.broadcast_forward(Some("b"), 10);
+        drop(tx);
+
+        assert_eq!(rx.recv(), Ok((Some("a"), 10)));
+        assert_eq!(rx.recv(), Ok((Some("b"), 10)));
+        assert_eq!(rx.recv(), Err(mpsc::RecvError));
     }
 
     fn fused_setup<T, F, G>
