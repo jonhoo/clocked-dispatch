@@ -1185,9 +1185,13 @@ mod tests {
             let tx = tx_a.to_broadcaster();
             for (x, ts) in rx_a {
                 if let Some("ax") = x {
-                    if ts % 2 == 0 {
+                    if ts % 3 == 0 {
                         tx.broadcast_forward(None, ts);
                         continue
+                    }
+                    if ts % 3 == 1 {
+                        tx.broadcast_forward(Some("axx"), ts);
+                        // so two sends for the same ts
                     }
                 }
                 tx.broadcast_forward(x, ts);
@@ -1200,9 +1204,13 @@ mod tests {
             let tx = tx_b.to_broadcaster();
             for (x, ts) in rx_b {
                 if let Some("bx") = x {
-                    if ts % 2 == 0 {
+                    if ts % 3 == 0 {
                         tx.broadcast_forward(None, ts);
                         continue
+                    }
+                    if ts % 3 == 1 {
+                        tx.broadcast_forward(Some("bxx"), ts);
+                        // so two sends for the same ts
                     }
                 }
                 tx.broadcast_forward(x, ts);
@@ -1244,8 +1252,8 @@ mod tests {
 
         let mut old = c2.1;
         for (c, ts) in c_in {
-            assert!(ts > old);
-            if ts % 2 == 0 {
+            assert!(ts >= old);
+            if ts % 3 == 0 {
                 assert!(c.is_none());
             } else {
                 assert!(c.is_some());
