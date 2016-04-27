@@ -892,8 +892,11 @@ impl<T: Clone> DispatchInner<T> {
                         // we increment at least one min
                         self.freshness.insert(td.from.clone(), ts);
                         if old == min {
+                            let nmin = self.min();
                             // we *may* have increased the global min
-                            self.process_delayed();
+                            if nmin > old {
+                                self.process_delayed();
+                            }
                         }
                     }
                 }
