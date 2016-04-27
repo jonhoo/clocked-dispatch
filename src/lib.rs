@@ -1146,4 +1146,111 @@ mod tests {
         assert_eq!(rx_a.recv(), Err(mpsc::RecvError));
         assert_eq!(rx_b.recv(), Err(mpsc::RecvError));
     }
+
+    #[test]
+    fn fuse_doesnt_travel_back() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        // Here we construct a graph like this:
+        //
+        //     a_in --+                +-- b_in
+        //       :    |                |     :
+        //       :    +-> dispatcher <-+     :
+        //       :         |      |          :
+        //       a <-------+      +--------> b
+        //       |                           |
+        //       v                           v
+        //   dispatcher                  dispatcher
+        //       |                           |
+        //       + broadcast       broadcast +
+        //       |                           |
+        //       +---------> fuse <----------+
+        //                    |
+        //                    v
+        //                    c
+        //
+        // a and b both broadcast to allow other c-like nodes to also subscribe to their updates (this
+        // is what the dispatchers hanging of a and b are for), though this is not used in the
+        // graph above. The dispatcher at the top assigns sequence numbers (i.e., a_in and b_in use
+        // send()).
+
+        let d = super::new::<&str>(20);
+        let (a_in, rx_a) = d.new("a_in", "rx_a");
+        let (b_in, rx_b) = d.new("b_in", "rx_b");
+
+        let ad = super::new(20);
+        let (tx_a, a_out) = ad.new("tx_a", "a_out");
+        thread::spawn(move || {
+            let tx = tx_a.to_broadcaster();
+            for (x, ts) in rx_a {
+                if let Some("ax") = x {
+                    if ts % 2 == 0 {
+                        tx.broadcast_forward(None, ts);
+                        continue
+                    }
+                }
+                tx.broadcast_forward(x, ts);
+            }
+        });
+
+        let bd = super::new(20);
+        let (tx_b, b_out) = bd.new("tx_b", "b_out");
+        thread::spawn(move || {
+            let tx = tx_b.to_broadcaster();
+            for (x, ts) in rx_b {
+                if let Some("bx") = x {
+                    if ts % 2 == 0 {
+                        tx.broadcast_forward(None, ts);
+                        continue
+                    }
+                }
+                tx.broadcast_forward(x, ts);
+            }
+        });
+
+        let c_in = super::fuse(vec![a_out, b_out], 20);
+
+        a_in.send("a1");
+
+        // the send should also cause b to receive a None
+        // a and b should thus broadcast with the same ts
+        // which brings all inputs of the fuse up to date
+        // so the fuse should output a Some("a").
+        assert_eq!(c_in.recv().unwrap().0, Some("a1"));
+
+        // since the fuse output something for the latest ts
+        // it should not also send a None with the same ts
+        assert_eq!(c_in.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        a_in.send("a2");
+        b_in.send("b");
+
+        let c1 = c_in.recv().unwrap();
+        let c2 = c_in.recv().unwrap();
+        assert!(c1.0.is_some());
+        assert!(c2.0.is_some());
+        assert!(c2.1 > c1.1);
+
+        thread::spawn(move || {
+            for i in 0..100 {
+                if i % 2 == 0 {
+                    a_in.send("ax");
+                } else {
+                    b_in.send("bx");
+                }
+            }
+        });
+
+        let mut old = c2.1;
+        for (c, ts) in c_in {
+            assert!(ts > old);
+            if ts % 2 == 0 {
+                assert!(c.is_none());
+            } else {
+                assert!(c.is_some());
+            }
+            old = ts;
+        }
+    }
 }
