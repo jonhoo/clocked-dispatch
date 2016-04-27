@@ -1394,4 +1394,41 @@ mod tests {
             assert_eq!(n, 2);
         }
     }
+
+    #[test]
+    fn multisend_thread_interleaving() {
+        use std::thread;
+
+        for _ in 0..1000 {
+            let d = super::new(20);
+            let (tx_a, rx) = d.new("tx_a", "rx");
+            let tx_b = tx_a.clone("tx_b");
+
+            let t_a = thread::spawn(move || {
+                tx_a.forward(Some("c_1"), 1);
+                tx_a.forward(None, 2); // absorbed
+                tx_a.forward(Some("c_3"), 3);
+                tx_a.forward(Some("a_1"), 5);
+                tx_a.forward(Some("a_2"), 6);
+            });
+            let t_b = thread::spawn(move || {
+                tx_b.forward(Some("c_1"), 1);
+                tx_b.forward(Some("c_2"), 2);
+                tx_b.forward(None, 3); // absorbed
+                tx_b.forward(Some("b_1"), 4);
+                tx_b.forward(None, 6);
+            });
+
+            assert_eq!(rx.recv(), Ok((Some("c_1"), 1)));
+            assert_eq!(rx.recv(), Ok((Some("c_1"), 1))); // received from both ins, so duped
+            assert_eq!(rx.recv(), Ok((Some("c_2"), 2)));
+            assert_eq!(rx.recv(), Ok((Some("c_3"), 3)));
+            assert_eq!(rx.recv(), Ok((Some("b_1"), 4)));
+            assert_eq!(rx.recv(), Ok((Some("a_1"), 5)));
+
+            t_a.join().unwrap();
+            t_b.join().unwrap();
+        }
+    }
+
 }
