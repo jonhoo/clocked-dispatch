@@ -912,13 +912,15 @@ impl<T: Clone> DispatchInner<T> {
             }
             Message::ReceiverJoin(name, inner) => {
                 debug!("{}: receiver {} joined", self.id, name);
-                self.targets.insert(name.clone(),
+                if !self.destinations.insert(name.clone()) {
+                    panic!("receiver {} already exists!", name);
+                }
+                self.targets.insert(name,
                                     Target {
                                         channel: inner,
                                         senders: HashSet::new(),
                                         delayed: BinaryHeap::new(),
                                     });
-                self.destinations.insert(name);
             }
             Message::ReceiverLeave(name) => {
                 debug!("{}: receiver {} left", self.id, name);
@@ -948,7 +950,11 @@ impl<T: Clone> DispatchInner<T> {
             }
             Message::SenderJoin(target, source) => {
                 debug!("{}: sender {} for {:?} joined", self.id, source, target);
-                self.freshness.insert(source.clone(), 0);
+
+                if self.freshness.insert(source.clone(), 0).is_some() {
+                    panic!("sender {} already exists!", source);
+                }
+
                 if let Some(target) = target {
                     self.targets.get_mut(&*target).unwrap().senders.insert(source);
                 } else {
