@@ -729,18 +729,21 @@ impl<T: Clone> DispatchInner<T> {
 
     /// Should be called whenever the set of senders changes to process.
     /// Processes delayed messages that can now be delivered, and closes channels with no senders.
-    fn senders_changed(&mut self, to: Option<String>) {
+    fn senders_changed(&mut self, to: Option<String>, min_changed: bool) {
+
         // if the removed sender has been delaying delivery of messages (by virtue of being the
         // sender with the lowest sequence number), we may now be able to send some more messages.
         // this can only happen if we're in forwarding mode, because in assignment mode, senders
         // don't have a way to not be up-to-date, and so there are no delayed messages.
-        if let Some(true) = self.forwarding {
-            self.process_delayed(to.as_ref());
+        if self.forwarding.unwrap_or(false) && min_changed {
+            self.process_delayed();
         }
 
         if self.broadcasters.is_empty() {
             // if there are broadcasters, no channel is closed
-            for (_, t) in self.targets.iter_mut().filter(|&(_, ref t)| t.senders.is_empty()) {
+            for (tn, t) in self.targets
+                               .iter_mut()
+                               .filter(|&(_, ref t)| t.senders.is_empty() && t.delayed.is_empty()) {
                 // having no senders when there are no broadcasters means the channel is closed
                 let mut state = t.channel.mx.lock().unwrap();
                 state.closed = true;
@@ -753,7 +756,7 @@ impl<T: Clone> DispatchInner<T> {
     /// Find any delayed messages that are now earlier than the minimum sender sequence number, and
     /// send them in-order. Will check both broadcast messages and messages to a given sender if
     /// `to.is_some()`.
-    fn process_delayed(&mut self, to: Option<&String>) {
+    fn process_delayed(&mut self) {
         let min = self.min();
 
         // keep track of the largest timestamp we notified receivers about
@@ -768,22 +771,24 @@ impl<T: Clone> DispatchInner<T> {
             //
             // 1. finding the smallest in `bdelay`
             let next = self.bdelay.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1);
-            if let Some(to) = to {
-                if self.targets.contains_key(to.as_str()) {
-                    // 2. finding the smallest in `targets[to].delayed`
-                    let tnext = self.targets[to.as_str()]
-                                    .delayed
-                                    .peek()
-                                    .and_then(|d| Some(d.ts))
-                                    .unwrap_or(min + 1);
-
-                    // 3. using the message from 2 if it is the earliest (and early enough)
-                    if tnext < next && tnext <= min {
-                        let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
-                        forwarded = d.ts;
-                        self.notify(Some(to), d.ts, Some(d.data));
-                        continue;
-                    }
+            // 2. finding the smallest in `targets[*].delayed`
+            let tnext = {
+                let t = self.destinations
+                            .iter()
+                            .map(|to| {
+                                let t = &self.targets[to];
+                                (to, t.delayed.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1))
+                            })
+                            .min_by_key(|&(_, ts)| ts);
+                t.and_then(|(to, ts)| Some((to.to_owned(), ts)))
+            };
+            // 3. using the message from 2 if it is the earliest (and early enough)
+            if let Some((to, tnext)) = tnext {
+                if tnext <= next && tnext <= min {
+                    let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
+                    forwarded = d.ts;
+                    self.notify(Some(&to), d.ts, Some(d.data));
+                    continue;
                 }
             }
 
@@ -860,7 +865,7 @@ impl<T: Clone> DispatchInner<T> {
                         self.freshness.insert(td.from.clone(), ts);
                         if old == min {
                             // we *may* have increased the global min
-                            self.process_delayed(td.to.as_ref());
+                            self.process_delayed();
                         }
                     }
                 }
@@ -917,8 +922,10 @@ impl<T: Clone> DispatchInner<T> {
                     self.broadcasters.remove(&*source);
                 }
 
+                let omin = self.min();
                 self.freshness.remove(&*source);
-                self.senders_changed(target);
+                let nmin = self.min();
+                self.senders_changed(target, omin != nmin);
             }
         }
     }
