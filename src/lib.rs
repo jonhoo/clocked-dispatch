@@ -1147,9 +1147,14 @@ mod tests {
         assert_eq!(rx_b.recv(), Err(mpsc::RecvError));
     }
 
-    #[test]
-    fn fuse_doesnt_travel_back() {
-        use std::sync::mpsc;
+    fn fused_setup<T, F, G>
+        (a: F,
+         b: G)
+         -> (super::ClockedSender<T>, super::ClockedSender<T>, super::ClockedReceiver<T>)
+        where F: Send + 'static + Fn(Option<T>, usize, &super::ClockedBroadcaster<T>),
+              G: Send + 'static + Fn(Option<T>, usize, &super::ClockedBroadcaster<T>),
+              T: Send + Clone
+    {
         use std::thread;
 
         // Here we construct a graph like this:
@@ -1170,12 +1175,12 @@ mod tests {
         //                    v
         //                    c
         //
-        // a and b both broadcast to allow other c-like nodes to also subscribe to their updates (this
-        // is what the dispatchers hanging of a and b are for), though this is not used in the
-        // graph above. The dispatcher at the top assigns sequence numbers (i.e., a_in and b_in use
-        // send()).
+        // a and b both broadcast to allow other c-like nodes to also subscribe to their updates
+        // (this is what the dispatchers hanging of a and b are for), though this is not used in
+        // the graph above. The dispatcher at the top assigns sequence numbers (i.e., a_in and b_in
+        // use send()).
 
-        let d = super::new::<&str>(20);
+        let d = super::new(20);
         let (a_in, rx_a) = d.new("a_in", "rx_a");
         let (b_in, rx_b) = d.new("b_in", "rx_b");
 
@@ -1184,17 +1189,7 @@ mod tests {
         thread::spawn(move || {
             let tx = tx_a.to_broadcaster();
             for (x, ts) in rx_a {
-                if let Some("ax") = x {
-                    if ts % 3 == 0 {
-                        tx.broadcast_forward(None, ts);
-                        continue
-                    }
-                    if ts % 3 == 1 {
-                        tx.broadcast_forward(Some("axx"), ts);
-                        // so two sends for the same ts
-                    }
-                }
-                tx.broadcast_forward(x, ts);
+                a(x, ts, &tx);
             }
         });
 
@@ -1203,21 +1198,25 @@ mod tests {
         thread::spawn(move || {
             let tx = tx_b.to_broadcaster();
             for (x, ts) in rx_b {
-                if let Some("bx") = x {
-                    if ts % 3 == 0 {
-                        tx.broadcast_forward(None, ts);
-                        continue
-                    }
-                    if ts % 3 == 1 {
-                        tx.broadcast_forward(Some("bxx"), ts);
-                        // so two sends for the same ts
-                    }
-                }
-                tx.broadcast_forward(x, ts);
+                b(x, ts, &tx);
             }
         });
 
         let c_in = super::fuse(vec![a_out, b_out], 20);
+        (a_in, b_in, c_in)
+    }
+
+    #[test]
+    fn deep_fuse_simple() {
+        use std::sync::mpsc;
+        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+
+        let (a_in, b_in, c_in) = fused_setup(a, b);
 
         a_in.send("a1");
 
@@ -1239,6 +1238,20 @@ mod tests {
         assert!(c1.0.is_some());
         assert!(c2.0.is_some());
         assert!(c2.1 > c1.1);
+    }
+
+    #[test]
+    fn deep_fuse_busy() {
+        use std::thread;
+
+        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+
+        let (a_in, b_in, c_in) = fused_setup(a, b);
 
         thread::spawn(move || {
             for i in 0..100 {
@@ -1250,15 +1263,109 @@ mod tests {
             }
         });
 
-        let mut old = c2.1;
+        let mut n = 0;
+        let mut old = 0;
         for (c, ts) in c_in {
-            assert!(ts >= old);
-            if ts % 3 == 0 {
+            assert!(ts > old);
+            assert!(c.is_some());
+            old = ts;
+            n += 1;
+        }
+        assert_eq!(n, 100);
+    }
+
+    #[test]
+    fn deep_fuse_busy_lossy() {
+        use std::thread;
+
+        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            if ts % 2 == 0 {
+                tx.broadcast_forward(None, ts);
+                return;
+            }
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            if ts % 2 == 0 {
+                tx.broadcast_forward(None, ts);
+                return;
+            }
+            tx.broadcast_forward(x, ts);
+        };
+
+        let (a_in, b_in, c_in) = fused_setup(a, b);
+
+        thread::spawn(move || {
+            for i in 0..100 {
+                if i % 2 == 0 {
+                    a_in.send("ax");
+                } else {
+                    b_in.send("bx");
+                }
+            }
+        });
+
+        let mut old = 0;
+        for (c, ts) in c_in {
+            assert!(ts > old);
+            if ts % 2 == 0 {
                 assert!(c.is_none());
             } else {
                 assert!(c.is_some());
             }
             old = ts;
+        }
+    }
+
+    #[test]
+    fn deep_fuse_dupe() {
+        use std::thread;
+
+        let a = |x: Option<_>, ts, tx: &super::ClockedBroadcaster<_>| {
+            if x.is_some() && ts % 2 == 0 {
+                tx.broadcast_forward(Some("axx"), ts);
+                // so two sends for the same ts
+            }
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x: Option<_>, ts, tx: &super::ClockedBroadcaster<_>| {
+            if x.is_some() && ts % 2 == 0 {
+                tx.broadcast_forward(Some("bxx"), ts);
+                // so two sends for the same ts
+            }
+            tx.broadcast_forward(x, ts);
+        };
+
+        let (a_in, b_in, c_in) = fused_setup(a, b);
+
+        thread::spawn(move || {
+            for i in 0..100 {
+                if i % 2 == 0 {
+                    a_in.send("ax");
+                } else {
+                    b_in.send("bx");
+                }
+            }
+        });
+
+        let mut n = 2;
+        let mut old = 0;
+        for (c, ts) in c_in {
+            assert!(ts >= old); // note >= for dupes
+            assert!(c.is_some());
+            if ts != old && n != 0 {
+                assert_eq!(n, 2);
+                n = 0;
+            }
+
+            if ts % 2 == 0 {
+                n += 1;
+            }
+            old = ts;
+        }
+
+        if n != 0 {
+            assert_eq!(n, 2);
         }
     }
 }
