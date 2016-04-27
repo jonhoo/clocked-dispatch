@@ -806,7 +806,7 @@ impl<T: Clone> DispatchInner<T> {
 
         // make sure all dependents know how up-to-date we are
         // even if we didn't send a delayed message for the min
-        if forwarded < min {
+        if forwarded < min && min != usize::max_value() - 1 {
             self.notify(None, min, None);
         }
     }
@@ -1087,5 +1087,33 @@ mod tests {
 
         // And that messages are still delivered
         assert_eq!(rx_b.recv(), Ok((Some(10), 1)));
+    }
+
+    #[test]
+    fn forward_with_no_senders() {
+        use std::sync::mpsc;
+
+        let d = super::new(1);
+        let (tx_a, rx_a) = d.new("atx", "arx");
+        let (tx_b, rx_b) = d.new("btx", "brx");
+
+        tx_a.forward(Some(1), 1);
+        // the message is queued because tx_b hasn't sent anything
+
+        // drop both senders, freeing Some(1) from the delayed queue. we specifically want to
+        // explore the case where Some(1) is freed when there are no senders, so we have to drop
+        // tx_a first (since tx_b is holding up the system).
+        drop(tx_a);
+        drop(tx_b);
+
+        // Ensure that receiver still gets notified of messages
+        assert_eq!(rx_a.recv(), Ok((Some(1), 1)));
+
+        // And that other still gets a None
+        assert_eq!(rx_b.recv(), Ok((None, 1)));
+
+        // And that no more entries are sent
+        assert_eq!(rx_a.recv(), Err(mpsc::RecvError));
+        assert_eq!(rx_b.recv(), Err(mpsc::RecvError));
     }
 }
