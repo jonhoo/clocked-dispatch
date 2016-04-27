@@ -1446,4 +1446,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fuse_broadcast() {
+        use std::thread;
+
+        for _ in 0..1 {
+            let a_cd = super::new(20);
+            let b_cd = super::new(20);
+
+            let (a_tx, x) = a_cd.new("a_tx", "_");
+            let a_tx = a_tx.to_broadcaster();
+            drop(x);
+
+            let (b_tx, x) = b_cd.new("b_tx", "_");
+            let b_tx = b_tx.to_broadcaster();
+            drop(x);
+
+            let (x, c_in_a) = a_cd.new("_", "c");
+            let (y, c_in_b) = b_cd.new("_", "c");
+            let c = super::fuse(vec![c_in_a, c_in_b], 20);
+            drop(x);
+            drop(y);
+
+            let t_a = thread::spawn(move || {
+                a_tx.broadcast_forward(Some("c_1"), 1);
+                a_tx.broadcast_forward(Some("c_2"), 2);
+                a_tx.broadcast_forward(None, 3);
+                a_tx.broadcast_forward(Some("a_1"), 5);
+                a_tx.broadcast_forward(Some("a_2"), 6);
+            });
+            let t_b = thread::spawn(move || {
+                b_tx.broadcast_forward(None, 1);
+                b_tx.broadcast_forward(Some("c_2"), 2);
+                b_tx.broadcast_forward(Some("c_3"), 3);
+                b_tx.broadcast_forward(Some("b_1"), 4);
+                b_tx.broadcast_forward(None, 6);
+            });
+
+            assert_eq!(c.recv(), Ok((Some("c_1"), 1)));
+            assert_eq!(c.recv(), Ok((Some("c_2"), 2)));
+            assert_eq!(c.recv(), Ok((Some("c_2"), 2))); // received from both ins, so duped
+            assert_eq!(c.recv(), Ok((Some("c_3"), 3)));
+            assert_eq!(c.recv(), Ok((Some("b_1"), 4)));
+            assert_eq!(c.recv(), Ok((Some("a_1"), 5)));
+
+            t_a.join().unwrap();
+            t_b.join().unwrap();
+        }
+    }
+
 }
