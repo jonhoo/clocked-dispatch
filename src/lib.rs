@@ -130,6 +130,16 @@ use std::collections::BinaryHeap;
 use std::sync::mpsc;
 use std::thread;
 
+macro_rules! debug {
+    ( $fmt:expr ) => {
+        //println!($fmt);
+    };
+    ( $fmt:expr, $( $args:expr ),+ ) => {
+        //println!($fmt, $($args),*);
+        $(let _ = $args)*;
+    };
+}
+
 struct TaggedData<T> {
     from: String,
     to: Option<String>,
@@ -702,8 +712,10 @@ impl<T: Clone> DispatchInner<T> {
     fn notify(&self, to: Option<&String>, ts: usize, data: Option<T>) {
         for (tn, t) in self.targets.iter() {
             let mut state = t.channel.mx.lock().unwrap();
+            debug!("notifying {} about {}", tn, ts);
             if data.is_some() {
                 if to.is_none() || to.unwrap() == tn.as_str() {
+                    debug!("including data");
                     while state.queue.len() == self.bound {
                         state = t.channel.cond.wait(state).unwrap();
                     }
@@ -730,6 +742,7 @@ impl<T: Clone> DispatchInner<T> {
     /// Should be called whenever the set of senders changes to process.
     /// Processes delayed messages that can now be delivered, and closes channels with no senders.
     fn senders_changed(&mut self, to: Option<String>, min_changed: bool) {
+        debug!("senders for {:?} changed", to);
 
         // if the removed sender has been delaying delivery of messages (by virtue of being the
         // sender with the lowest sequence number), we may now be able to send some more messages.
@@ -744,6 +757,7 @@ impl<T: Clone> DispatchInner<T> {
             for (tn, t) in self.targets
                                .iter_mut()
                                .filter(|&(_, ref t)| t.senders.is_empty() && t.delayed.is_empty()) {
+                debug!("closing now-done channel {}", tn);
                 // having no senders when there are no broadcasters means the channel is closed
                 let mut state = t.channel.mx.lock().unwrap();
                 state.closed = true;
@@ -758,6 +772,7 @@ impl<T: Clone> DispatchInner<T> {
     /// `to.is_some()`.
     fn process_delayed(&mut self) {
         let min = self.min();
+        debug!("processing delayed, min is {}", min);
 
         // keep track of the largest timestamp we notified receivers about
         // so that we also know to update their up-to-date-ness if the min
@@ -771,6 +786,7 @@ impl<T: Clone> DispatchInner<T> {
             //
             // 1. finding the smallest in `bdelay`
             let next = self.bdelay.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1);
+            debug!("next from bcast is {:?}", next);
             // 2. finding the smallest in `targets[*].delayed`
             let tnext = {
                 let t = self.destinations
@@ -782,9 +798,11 @@ impl<T: Clone> DispatchInner<T> {
                             .min_by_key(|&(_, ts)| ts);
                 t.and_then(|(to, ts)| Some((to.to_owned(), ts)))
             };
+            debug!("next from tdelay is {:?}", tnext);
             // 3. using the message from 2 if it is the earliest (and early enough)
             if let Some((to, tnext)) = tnext {
                 if tnext <= next && tnext <= min {
+                    debug!("forwarding from tdelay");
                     let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
                     forwarded = d.ts;
                     self.notify(Some(&to), d.ts, Some(d.data));
@@ -794,6 +812,7 @@ impl<T: Clone> DispatchInner<T> {
 
             // 4. using the message from 1 (which must now be the earliest) if it is early enough
             if next <= min {
+                debug!("forwarding from bdelay");
                 let d = self.bdelay.pop().unwrap();
                 forwarded = d.ts;
                 self.notify(None, d.ts, Some(d.data));
@@ -804,9 +823,13 @@ impl<T: Clone> DispatchInner<T> {
             break;
         }
 
+        debug!("done replaying");
+
         // make sure all dependents know how up-to-date we are
         // even if we didn't send a delayed message for the min
         if forwarded < min && min != usize::max_value() - 1 {
+            // if forwarded < min {
+            debug!("sending notify None for {} (since > {})", min, forwarded);
             self.notify(None, min, None);
         }
     }
@@ -822,6 +845,7 @@ impl<T: Clone> DispatchInner<T> {
     fn absorb(&mut self, m: Message<T>) {
         match m {
             Message::Data(td) => {
+                debug!("got message");
                 if self.forwarding.is_some() {
                     assert!(self.forwarding.unwrap() == td.ts.is_some(),
                             "one sender sent timestamp, another did not");
@@ -847,11 +871,13 @@ impl<T: Clone> DispatchInner<T> {
                     // updates in order.
                     if let Some(data) = td.data {
                         if let Some(ref to) = td.to {
+                            debug!("delayed in {:?}", to);
                             self.targets.get_mut(to).unwrap().delayed.push(Delayed {
                                 ts: ts,
                                 data: data,
                             });
                         } else {
+                            debug!("delayed in bcast");
                             self.bdelay.push(Delayed {
                                 ts: ts,
                                 data: data,
@@ -871,6 +897,7 @@ impl<T: Clone> DispatchInner<T> {
                 }
             }
             Message::ReceiverJoin(name, inner) => {
+                debug!("receiver {} joined", name);
                 self.targets.insert(name.clone(),
                                     Target {
                                         channel: inner,
@@ -880,6 +907,7 @@ impl<T: Clone> DispatchInner<T> {
                 self.destinations.insert(name);
             }
             Message::ReceiverLeave(name) => {
+                debug!("receiver {} left", name);
                 // Close the channel (to allow the receiver cleanup to complete)
                 {
                     // scope to end immutable borrow of self.targets
@@ -905,6 +933,7 @@ impl<T: Clone> DispatchInner<T> {
                 // crashing and burning (panic) like what happens now.
             }
             Message::SenderJoin(target, source) => {
+                debug!("sender {} for {:?} joined", source, target);
                 self.freshness.insert(source.clone(), 0);
                 if let Some(target) = target {
                     self.targets.get_mut(&*target).unwrap().senders.insert(source);
@@ -913,6 +942,7 @@ impl<T: Clone> DispatchInner<T> {
                 }
             }
             Message::SenderLeave(target, source) => {
+                debug!("sender {} for {:?} left", source, target);
                 if let Some(ref target) = target {
                     // NOTE: target may not exist because receiver has left
                     if let Some(target) = self.targets.get_mut(target.as_str()) {
