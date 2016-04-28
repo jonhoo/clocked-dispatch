@@ -1501,4 +1501,141 @@ mod tests {
         }
     }
 
+    #[test]
+    fn joining_receiver() {
+        use std::thread;
+        use std::time::Duration;
+
+        let d = super::new(20);
+        let (tx1, rx1) = d.new("tx1", "rx1");
+        let tx1 = tx1.to_broadcaster();
+
+        thread::spawn(move || {
+            for i in 0..10000 {
+                tx1.broadcast(i);
+            }
+        });
+        thread::spawn(move || {
+            rx1.count(); // consumes the channel
+        });
+
+        // give sender some time to start
+        thread::sleep(Duration::from_millis(10));
+
+        // start a new receiver
+        let (tx2, rx2) = d.new("tx2", "rx2");
+        drop(tx2);
+
+        let mut prev = None;
+        while let Ok((Some(i), _)) = rx2.recv() {
+            if let Some(ref pi) = prev {
+                assert_eq!(*pi + 1, i);
+            }
+            prev = Some(i);
+        }
+        assert!(prev.is_some());
+    }
+
+    #[test]
+    fn joining_fused_receiver() {
+        use std::thread;
+        use std::time::Duration;
+
+        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+
+        let ((a_in, ad), (_b_in, _), c_in) = fused_setup(a, b);
+
+        // start a long-running sender
+        thread::spawn(move || {
+            for i in 0..10000 {
+                a_in.send(i);
+            }
+        });
+
+        // consume fused output
+        thread::spawn(move || {
+            c_in.count(); // consumes the channel
+        });
+
+        // give sender some time to start
+        thread::sleep(Duration::from_millis(10));
+
+        // new node wants to receive from a's broadcast output
+        let (tmptx, a_out) = ad.new("tmptx", "a_out2");
+        let d_in = super::fuse(vec![a_out], 20);
+        drop(tmptx);
+
+        // new node should see a's sends
+        let mut prev = None;
+        while let Ok((Some(i), _)) = d_in.recv() {
+            if let Some(ref pi) = prev {
+                assert_eq!(*pi + 1, i);
+            }
+            prev = Some(i);
+        }
+        assert!(prev.is_some());
+    }
+
+    #[test]
+    fn joining_fused_quiet_sender() {
+        use std::thread;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+
+        let ((a_in, _), (b_in, _), c_in) = fused_setup(a, b);
+
+        // start a long-running sender on a
+        thread::spawn(move || {
+            for i in 0..10000 {
+                a_in.send(i);
+            }
+        });
+
+        // quiet node b should not prevent c from finishing
+        let mut prev = None;
+        let mut waits = 0;
+        loop {
+            let r = c_in.try_recv();
+            if let Err(mpsc::TryRecvError::Disconnected) = r {
+                break;
+            }
+            if let Ok((Some(i), _)) = r {
+                if let Some(ref pi) = prev {
+                    assert_eq!(*pi + 1, i);
+                }
+                prev = Some(i);
+                waits = 0;
+
+                if i == 9999 {
+                    // sender has finished
+                    // should now be safe to consume the channel
+                    // once b has been dropped
+                    drop(b_in);
+                    c_in.count();
+                    break;
+                }
+
+                continue;
+            }
+
+            // nothing in the channel; let's wait for a little while
+            // unless we've already waited for way too long
+            assert!(waits < 10);
+            thread::sleep(Duration::from_millis(1));
+            waits += 1;
+        }
+        assert!(prev.is_some());
+    }
 }
