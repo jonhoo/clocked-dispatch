@@ -1634,7 +1634,7 @@ mod tests {
 
             // nothing in the channel; let's wait for a little while
             // unless we've already waited for way too long
-            assert!(waits < 10);
+            assert!(waits < 100);
             thread::sleep(Duration::from_millis(1));
             waits += 1;
         }
