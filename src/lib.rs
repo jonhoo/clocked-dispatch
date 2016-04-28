@@ -1595,4 +1595,68 @@ mod tests {
         }
         assert!(prev.is_some());
     }
+
+    #[test]
+    fn joining_adjacent() {
+        use std::thread;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
+            tx.broadcast_forward(x, ts);
+        };
+
+        let (d, (a_in, _), (b_in, bd), ab_in) = fused_setup(a, b);
+
+        // start a receiver for ab to avoid blocking any inputs
+        let ab_t = thread::spawn(move || {
+            ab_in.count();
+        });
+
+        // send some stuff on a and b
+        a_in.send("a1");
+        b_in.send("b1");
+
+        // sleep a while to avoid race where bc sees b1
+        thread::sleep(Duration::from_millis(100));
+
+        // add another base input
+        let (c_in, rx_c) = d.new("c_in", "rx_c");
+        let cd = super::new(20);
+        let (tx_c, c_out) = cd.new("tx_c", "c_out");
+        thread::spawn(move || {
+            let tx = tx_c.to_broadcaster();
+            for (x, ts) in rx_c {
+                tx.broadcast_forward(x, ts);
+            }
+        });
+
+        // add another node that fuses b and c
+        // 1. get another out from b
+        let (b_tmp, b_out) = bd.new("bc_tx", "bc_rx");
+        drop(b_tmp);
+        let bc_in = super::fuse(vec![b_out, c_out], 20);
+
+        // check that sends from b and c both get to bc
+        b_in.send("b2");
+        c_in.send("c1");
+        assert!(bc_in.recv().unwrap().0.is_some());
+        assert!(bc_in.recv().unwrap().0.is_some());
+        assert_eq!(bc_in.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        // dropping all ab inputs should free up ab receiver
+        drop(a_in);
+        drop(b_in);
+        ab_t.join().unwrap();
+
+        // but should not free up bc receiver
+        assert_eq!(bc_in.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        // dropping c should finally free up bc
+        drop(c_in);
+        assert_eq!(bc_in.recv(), Err(mpsc::RecvError));
+    }
 }
