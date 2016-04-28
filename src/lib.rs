@@ -1248,17 +1248,15 @@ mod tests {
         (d, (a_in, ad), (b_in, bd), c_in)
     }
 
+    fn fw<T: Send + Clone>(x: Option<T>, ts: usize, tx: &super::ClockedBroadcaster<T>) {
+        tx.broadcast_forward(x, ts);
+    }
+
     #[test]
     fn deep_fuse_simple() {
         use std::sync::mpsc;
-        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
 
-        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(fw, fw);
 
         a_in.send("a1");
 
@@ -1286,14 +1284,7 @@ mod tests {
     fn deep_fuse_busy() {
         use std::thread;
 
-        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-
-        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(fw, fw);
 
         thread::spawn(move || {
             for i in 0..100 {
@@ -1509,14 +1500,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-
-        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(fw, fw);
 
         // start a long-running sender on a
         thread::spawn(move || {
@@ -1567,14 +1551,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-
-        let (d, (a_in, _), (b_in, bd), ab_in) = fused_setup(a, b);
+        let (d, (a_in, _), (b_in, bd), ab_in) = fused_setup(fw, fw);
 
         // start a receiver for ab to avoid blocking any inputs
         let ab_t = thread::spawn(move || {
