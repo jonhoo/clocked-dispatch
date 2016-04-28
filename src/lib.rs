@@ -1504,41 +1504,6 @@ mod tests {
     }
 
     #[test]
-    fn joining_receiver() {
-        use std::thread;
-        use std::time::Duration;
-
-        let d = super::new(20);
-        let (tx1, rx1) = d.new("tx1", "rx1");
-        let tx1 = tx1.to_broadcaster();
-
-        thread::spawn(move || {
-            for i in 0..10000 {
-                tx1.broadcast(i);
-            }
-        });
-        thread::spawn(move || {
-            rx1.count(); // consumes the channel
-        });
-
-        // give sender some time to start
-        thread::sleep(Duration::from_millis(10));
-
-        // start a new receiver
-        let (tx2, rx2) = d.new("tx2", "rx2");
-        drop(tx2);
-
-        let mut prev = None;
-        while let Ok((Some(i), _)) = rx2.recv() {
-            if let Some(ref pi) = prev {
-                assert_eq!(*pi + 1, i);
-            }
-            prev = Some(i);
-        }
-        assert!(prev.is_some());
-    }
-
-    #[test]
     fn joining_fused_quiet_sender() {
         use std::thread;
         use std::sync::mpsc;
