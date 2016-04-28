@@ -1539,51 +1539,6 @@ mod tests {
     }
 
     #[test]
-    fn joining_fused_receiver() {
-        use std::thread;
-        use std::time::Duration;
-
-        let a = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-        let b = |x, ts, tx: &super::ClockedBroadcaster<_>| {
-            tx.broadcast_forward(x, ts);
-        };
-
-        let (_, (a_in, ad), (_b_in, _), c_in) = fused_setup(a, b);
-
-        // start a long-running sender
-        thread::spawn(move || {
-            for i in 0..10000 {
-                a_in.send(i);
-            }
-        });
-
-        // consume fused output
-        thread::spawn(move || {
-            c_in.count(); // consumes the channel
-        });
-
-        // give sender some time to start
-        thread::sleep(Duration::from_millis(10));
-
-        // new node wants to receive from a's broadcast output
-        let (tmptx, a_out) = ad.new("tmptx", "a_out2");
-        let d_in = super::fuse(vec![a_out], 20);
-        drop(tmptx);
-
-        // new node should see a's sends
-        let mut prev = None;
-        while let Ok((Some(i), _)) = d_in.recv() {
-            if let Some(ref pi) = prev {
-                assert_eq!(*pi + 1, i);
-            }
-            prev = Some(i);
-        }
-        assert!(prev.is_some());
-    }
-
-    #[test]
     fn joining_fused_quiet_sender() {
         use std::thread;
         use std::sync::mpsc;
