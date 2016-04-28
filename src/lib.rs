@@ -1187,10 +1187,12 @@ mod tests {
         assert_eq!(rx.recv(), Err(mpsc::RecvError));
     }
 
-    fn fused_setup<T, F, G>
-        (a: F,
-         b: G)
-         -> (super::ClockedSender<T>, super::ClockedSender<T>, super::ClockedReceiver<T>)
+    fn fused_setup<T, F, G>(a: F,
+                            b: G)
+                            -> (super::Dispatcher<T>,
+                                (super::ClockedSender<T>, super::Dispatcher<T>),
+                                (super::ClockedSender<T>, super::Dispatcher<T>),
+                                super::ClockedReceiver<T>)
         where F: Send + 'static + Fn(Option<T>, usize, &super::ClockedBroadcaster<T>),
               G: Send + 'static + Fn(Option<T>, usize, &super::ClockedBroadcaster<T>),
               T: Send + Clone
@@ -1243,7 +1245,7 @@ mod tests {
         });
 
         let c_in = super::fuse(vec![a_out, b_out], 20);
-        (a_in, b_in, c_in)
+        (d, (a_in, ad), (b_in, bd), c_in)
     }
 
     #[test]
@@ -1256,7 +1258,7 @@ mod tests {
             tx.broadcast_forward(x, ts);
         };
 
-        let (a_in, b_in, c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
 
         a_in.send("a1");
 
@@ -1291,7 +1293,7 @@ mod tests {
             tx.broadcast_forward(x, ts);
         };
 
-        let (a_in, b_in, c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
 
         thread::spawn(move || {
             for i in 0..100 {
@@ -1335,7 +1337,7 @@ mod tests {
             }
         };
 
-        let (a_in, b_in, c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
 
         thread::spawn(move || {
             for i in 0..100 {
@@ -1383,7 +1385,7 @@ mod tests {
             tx.broadcast_forward(x, ts);
         };
 
-        let (a_in, b_in, c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
 
         thread::spawn(move || {
             for i in 0..100 {
@@ -1548,7 +1550,7 @@ mod tests {
             tx.broadcast_forward(x, ts);
         };
 
-        let ((a_in, ad), (_b_in, _), c_in) = fused_setup(a, b);
+        let (_, (a_in, ad), (_b_in, _), c_in) = fused_setup(a, b);
 
         // start a long-running sender
         thread::spawn(move || {
@@ -1594,7 +1596,7 @@ mod tests {
             tx.broadcast_forward(x, ts);
         };
 
-        let ((a_in, _), (b_in, _), c_in) = fused_setup(a, b);
+        let (_, (a_in, _), (b_in, _), c_in) = fused_setup(a, b);
 
         // start a long-running sender on a
         thread::spawn(move || {
