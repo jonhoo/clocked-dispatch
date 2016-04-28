@@ -1563,7 +1563,7 @@ mod tests {
         b_in.send("b1");
 
         // sleep a while to avoid race where bc sees b1
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(500));
 
         // add another base input
         let (c_in, rx_c) = d.new("c_in", "rx_c");
