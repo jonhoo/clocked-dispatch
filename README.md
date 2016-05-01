@@ -59,6 +59,16 @@ delaying the delivery of messages until it can guarantee that no earlier
 messages will later arrive. See the crate documentation for details
 about this mode of operation.
 
+## TODOs
+
+- Avoid one slow path in the graph blocking sends through independent
+  paths. This can be done by not sharing a single channel between all
+  senders to a dispatcher. Instead, the dispatcher should have a
+  separate channel for each sender, and select between those whose
+  recipient has space in their buffer. Unless we switch to an [external
+  channel library](https://github.com/BurntSushi/chan), this blocks on
+  [rust#27800](https://github.com/rust-lang/rust/issues/27800).
+
 ## License
 
 Licensed under either of
