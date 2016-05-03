@@ -1131,6 +1131,7 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
                     leaving_.push(left);
                 }
             }
+            leaving.extend(leaving_.drain(..));
         }
     });
 
