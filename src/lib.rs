@@ -130,6 +130,7 @@ use std::collections::VecDeque;
 use std::collections::BinaryHeap;
 use std::sync::mpsc;
 use std::thread;
+use std::sync;
 
 macro_rules! debug {
     ( $fmt:expr ) => {
@@ -456,6 +457,7 @@ struct QueueState<T> {
     ts_head: usize,
     ts_tail: usize,
     closed: bool,
+    left: bool,
 }
 
 struct ReceiverInner<T> {
@@ -468,25 +470,28 @@ struct ReceiverInner<T> {
 /// A clocked receiver will receive all messages sent by one of its associated senders. It will
 /// also receive notifications whenever a message with a higher timestamp than any it has seen has
 /// been sent to another receiver under the same dispatcher.
+///
+/// Dropping it will unblock any senders trying to send to this receiver.
 pub struct ClockedReceiver<T: Send + 'static> {
-    dispatcher: mpsc::SyncSender<Message<T>>,
+    leave: mpsc::SyncSender<String>,
     inner: Arc<ReceiverInner<T>>,
     name: String,
 }
 
 impl<T: Send + 'static> ClockedReceiver<T> {
     fn new<V: Into<String>>(name: V,
-                            dispatcher: mpsc::SyncSender<Message<T>>,
+                            leave: mpsc::SyncSender<String>,
                             bound: usize)
                             -> ClockedReceiver<T> {
         ClockedReceiver {
-            dispatcher: dispatcher,
+            leave: leave,
             inner: Arc::new(ReceiverInner {
                 mx: Mutex::new(QueueState {
                     queue: VecDeque::with_capacity(bound),
                     ts_head: 0,
                     ts_tail: 0,
                     closed: false,
+                    left: false,
                 }),
                 cond: Condvar::new(),
             }),
@@ -507,16 +512,7 @@ impl<T: Send + 'static> Drop for ClockedReceiver<T> {
         use std::mem;
 
         let name = mem::replace(&mut self.name, String::new());
-        let dp = self.dispatcher.clone();
-        thread::spawn(move || {
-            dp.send(Message::ReceiverLeave(name)).unwrap();
-        });
-
-        // we're dropping the receiver, but the dispatcher might be blocked trying to send us
-        // something. we therefore need to keep reading until the dispatcher actually gets around
-        // to closing the channel. this can be done in a separate thread to let the drop finish
-        // though, since there's no reason to make the caller wait for this to happen (I think).
-        self.count(); // count will iterate on the channel until it's closed
+        self.leave.send(name).unwrap();
     }
 }
 
@@ -553,6 +549,7 @@ impl<T: Send + 'static> ClockedReceiver<T> {
 
         if state.ts_head == state.ts_tail {
             // we must be closed
+            assert_eq!(state.closed, true);
             return Err(mpsc::RecvError);
         }
 
@@ -578,6 +575,7 @@ impl<T: Send + 'static> ClockedReceiver<T> {
 
         if state.ts_head == state.ts_tail {
             // we must be closed
+            assert_eq!(state.closed, true);
             return Err(mpsc::TryRecvError::Disconnected);
         }
 
@@ -598,6 +596,7 @@ impl<T: Send + 'static> ClockedReceiver<T> {
 /// Dispatch coordinator for adding additional clocked channels.
 pub struct Dispatcher<T: Send> {
     dispatcher: mpsc::SyncSender<Message<T>>,
+    leave: mpsc::SyncSender<String>,
     bound: usize,
 }
 
@@ -626,7 +625,7 @@ impl<T: Send> Dispatcher<T> {
             target: target.clone(),
             dispatcher: self.dispatcher.clone(),
         };
-        let recv = ClockedReceiver::new(target.clone(), self.dispatcher.clone(), self.bound);
+        let recv = ClockedReceiver::new(target.clone(), self.leave.clone(), self.bound);
 
         self.dispatcher.send(Message::ReceiverJoin(target.clone(), recv.inner.clone())).unwrap();
         self.dispatcher.send(Message::SenderJoin(Some(target.clone()), source)).unwrap();
@@ -668,7 +667,8 @@ struct Target<T> {
     // the receiver's channel
     channel: Arc<ReceiverInner<T>>,
     // messages for this receiver that have high timestamps, and must be delayed
-    delayed: BinaryHeap<Delayed<T>>,
+    // the mutex is so that we can allow the control thread to have an &Target without T: Sync
+    delayed: sync::Mutex<BinaryHeap<Delayed<T>>>,
     // known senders for this receiver
     senders: HashSet<String>,
 }
@@ -686,7 +686,8 @@ struct Target<T> {
 // for broadcast dispatchers.
 struct DispatchInner<T> {
     // per-receiver information
-    targets: HashMap<String, Target<T>>,
+    // needs to be locked so that control thread can access ReceiverInner Arcs
+    targets: sync::Arc<sync::RwLock<HashMap<String, Target<T>>>>,
     // per-sender information
     freshness: HashMap<String, usize>,
     // essentially targets.keys()
@@ -714,14 +715,20 @@ impl<T: Clone> DispatchInner<T> {
     /// If `to == None`, `data.unwrap()` is sent to all receivers.
     /// If `to == Some(t)`, `data.unwrap()` is sent to the the receiver named `t`.
     fn notify(&self, to: Option<&String>, ts: usize, data: Option<T>) {
-        for (tn, t) in self.targets.iter() {
+        let tgts = self.targets.read().unwrap();
+        for (tn, t) in tgts.iter() {
             let mut state = t.channel.mx.lock().unwrap();
             debug!("{}: notifying {} about {}", self.id, tn, ts);
             if data.is_some() {
                 if to.is_none() || to.unwrap() == tn.as_str() {
                     debug!("{}: including data", self.id);
-                    while state.queue.len() == self.bound {
+                    while state.queue.len() == self.bound && !state.left {
                         state = t.channel.cond.wait(state).unwrap();
+                    }
+
+                    if state.left {
+                        t.channel.cond.notify_one();
+                        continue;
                     }
 
                     // TODO: avoid clone() for the last send
@@ -758,9 +765,11 @@ impl<T: Clone> DispatchInner<T> {
 
         if self.broadcasters.is_empty() {
             // if there are broadcasters, no channel is closed
-            for (tn, t) in self.targets
-                               .iter_mut()
-                               .filter(|&(_, ref t)| t.senders.is_empty() && t.delayed.is_empty()) {
+            let mut tgts = self.targets.write().unwrap();
+            for (tn, t) in tgts.iter_mut()
+                .filter(|&(_, ref t)| {
+                    t.senders.is_empty() && t.delayed.lock().unwrap().is_empty()
+                }) {
                 debug!("{}: closing now-done channel {}", self.id, tn);
                 // having no senders when there are no broadcasters means the channel is closed
                 let mut state = t.channel.mx.lock().unwrap();
@@ -793,13 +802,20 @@ impl<T: Clone> DispatchInner<T> {
             debug!("{}: next from bcast is {:?}", self.id, next);
             // 2. finding the smallest in `targets[*].delayed`
             let tnext = {
+                let tgts = self.targets.read().unwrap();
                 let t = self.destinations
-                            .iter()
-                            .map(|to| {
-                                let t = &self.targets[to];
-                                (to, t.delayed.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1))
-                            })
-                            .min_by_key(|&(_, ts)| ts);
+                    .iter()
+                    .map(|to| {
+                        let t = &tgts[to];
+                        (to,
+                         t.delayed
+                            .lock()
+                            .unwrap()
+                            .peek()
+                            .and_then(|d| Some(d.ts))
+                            .unwrap_or(min + 1))
+                    })
+                    .min_by_key(|&(_, ts)| ts);
                 t.and_then(|(to, ts)| Some((to.to_owned(), ts)))
             };
             debug!("{}: next from tdelay is {:?}", self.id, tnext);
@@ -807,7 +823,11 @@ impl<T: Clone> DispatchInner<T> {
             if let Some((to, tnext)) = tnext {
                 if tnext <= next && tnext <= min {
                     debug!("{}: forwarding from tdelay", self.id);
-                    let d = self.targets.get_mut(to.as_str()).unwrap().delayed.pop().unwrap();
+                    let d = {
+                        let tgts = self.targets.read().unwrap();
+                        let mut x = tgts[to.as_str()].delayed.lock().unwrap();
+                        x.pop().unwrap()
+                    };
                     forwarded = d.ts;
                     self.notify(Some(&to), d.ts, Some(d.data));
                     continue;
@@ -883,10 +903,12 @@ impl<T: Clone> DispatchInner<T> {
                     if let Some(data) = td.data {
                         if let Some(ref to) = td.to {
                             debug!("{}: delayed in {:?}", self.id, to);
-                            self.targets.get_mut(to).unwrap().delayed.push(Delayed {
+                            let tgts = self.targets.read().unwrap();
+                            tgts[to].delayed.lock().unwrap().push(Delayed {
                                 ts: ts,
                                 data: data,
                             });
+                            drop(tgts);
                         } else {
                             debug!("{}: delayed in bcast", self.id);
                             self.bdelay.push(Delayed {
@@ -915,35 +937,37 @@ impl<T: Clone> DispatchInner<T> {
                 if !self.destinations.insert(name.clone()) {
                     panic!("receiver {} already exists!", name);
                 }
-                self.targets.insert(name,
-                                    Target {
-                                        channel: inner,
-                                        senders: HashSet::new(),
-                                        delayed: BinaryHeap::new(),
-                                    });
+
+                let mut tgts = self.targets.write().unwrap();
+                tgts.insert(name,
+                            Target {
+                                channel: inner,
+                                senders: HashSet::new(),
+                                delayed: sync::Mutex::new(BinaryHeap::new()),
+                            });
             }
             Message::ReceiverLeave(name) => {
                 debug!("{}: receiver {} left", self.id, name);
-                // Close the channel (to allow the receiver cleanup to complete)
-                {
-                    // scope to end immutable borrow of self.targets
-                    let t = &self.targets[&*name];
-                    let mut state = t.channel.mx.lock().unwrap();
-                    state.closed = true;
-                    t.channel.cond.notify_one();
-                    drop(state);
-                }
+                // NOTE: Control thread has already unblocked senders and set .left
 
-                // Deregister all senders (so they don't hold up due to freshness)
-                {
-                    for s in self.targets[&*name].senders.iter() {
-                        self.freshness.remove(s.as_str());
-                    }
-                }
+                // Deregister all senders (so they don't hold sending up due to freshness)
+                let changed = {
+                    let mut tgts = self.targets.write().unwrap();
+                    let changed = {
+                        let omin = self.min();
+                        for s in tgts[&*name].senders.iter() {
+                            self.freshness.remove(s.as_str());
+                        }
+                        self.min() != omin
+                    };
 
-                // Deregister the receiver
-                self.targets.remove(&*name);
-                self.destinations.remove(&*name);
+                    // Deregister the receiver
+                    tgts.remove(&*name);
+                    self.destinations.remove(&*name);
+                    changed
+                };
+
+                self.senders_changed(Some(name), changed);
 
                 // TODO: ensure that subsequent send()'s return an error (somehow?) instead of just
                 // crashing and burning (panic) like what happens now.
@@ -956,7 +980,8 @@ impl<T: Clone> DispatchInner<T> {
                 }
 
                 if let Some(target) = target {
-                    self.targets.get_mut(&*target).unwrap().senders.insert(source);
+                    let mut tgts = self.targets.write().unwrap();
+                    tgts.get_mut(&*target).unwrap().senders.insert(source);
                 } else {
                     self.broadcasters.insert(source);
                 }
@@ -965,9 +990,11 @@ impl<T: Clone> DispatchInner<T> {
                 debug!("{}: sender {} for {:?} left", self.id, source, target);
                 if let Some(ref target) = target {
                     // NOTE: target may not exist because receiver has left
-                    if let Some(target) = self.targets.get_mut(target.as_str()) {
+                    let mut tgts = self.targets.write().unwrap();
+                    if let Some(target) = tgts.get_mut(target.as_str()) {
                         target.senders.remove(&*source);
                     }
+                    drop(tgts);
                 } else {
                     self.broadcasters.remove(&*source);
                 }
@@ -998,7 +1025,7 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
 
     let (stx, srx) = mpsc::sync_channel(bound);
     let mut d = DispatchInner {
-        targets: HashMap::new(),
+        targets: sync::Arc::new(sync::RwLock::new(HashMap::new())),
         destinations: HashSet::new(),
         bdelay: BinaryHeap::new(),
         broadcasters: HashSet::new(),
@@ -1008,6 +1035,102 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
         id: thread_rng().gen_ascii_chars().take(2).collect(),
     };
 
+    let id = d.id.clone();
+    let c_targets = d.targets.clone();
+    let c_stx = stx.clone();
+    let (ctx, crx) = mpsc::sync_channel::<String>(0);
+    thread::spawn(move || {
+        // this thread handles leaving receivers.
+        // it is *basically* the following loop:
+        //
+        // ```
+        // for left in crx {
+        //   c_targets[left].channel.left = true;
+        //   ctx.send(ReceiverLeave(left));
+        // }
+        // ```
+        //
+        // unfortunately, it gets complicated by two factors:
+        //
+        //  - if a receiver is created and then dropped immediately, the Leave could reach us
+        //    before the Join reaches the dispatcher. in this case, targets[left] doesn't exist
+        //    yet. we thus need to wait for the dispatcher to catch up to the join.
+        //
+        //  - the dispatcher can't be blocking on a send to the receiver we are dropping because
+        //    it doesn't know about it yet, and thus must process the join message before it can
+        //    block waiting on us). however, there *is* a possibility of the dispatcher being
+        //    blocked on a send to a channel that is queued to be dropped *behind* this one. this
+        //    is the source of much of the complexity below.
+        //
+        // essentially, we keep track of leaving receivers that we haven't successfully handled
+        // yet, but also keep reading from crx to see if there are other receivers that are also
+        // trying to leave.
+
+        // receivers that are trying to leave
+        let mut leaving = Vec::new();
+        // temp for keeping track of nodes are *still* trying to leave while draining `leaving`
+        let mut leaving_ = Vec::new();
+
+        'recv: loop {
+            // are there more receivers trying to leave?
+            let left = crx.try_recv();
+            match left {
+                Ok(left) => {
+                    // yes -- deal with them too
+                    leaving.push(left);
+                }
+                Err(..) if !leaving.is_empty() => {
+                    // no, but deal with the receivers that wanted to leave
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // no, and there will never be more
+                    // we must also have dealt with all receivers who tried to leave
+                    // it's safe for us to exit
+                    break 'recv;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // no, and there also aren't any for us to retry
+                    // to avoid busy looping, we can now do a blocking receive
+                    let left = crx.recv();
+                    if let Ok(left) = left {
+                        // someone tried to leave -- let's try to deal with that
+                        leaving.push(left);
+                    } else {
+                        // channel closed, and no one is waiting -- safe to exit
+                        break 'recv;
+                    }
+                }
+            }
+
+            // try to process any receivers trying to leave
+            for left in leaving.drain(..) {
+                debug!("{} control: dealing with departure of receiver {}",
+                       id,
+                       left);
+
+                let targets = c_targets.read().unwrap();
+                if let Some(t) = targets.get(&*left) {
+                    // the receiver exists, so we can remove it
+                    let mut state = t.channel.mx.lock().unwrap();
+                    state.left = true;
+                    t.channel.cond.notify_one();
+                    drop(state);
+
+                    // kick off a message to the dispatcher in the background.
+                    // we don't want it to be in the foreground, because we may have other things
+                    // to close that could block sending to the dispatcher.
+                    let ctx = c_stx.clone();
+                    thread::spawn(move || {
+                        ctx.send(Message::ReceiverLeave(left)).unwrap();
+                    });
+                } else {
+                    // dispatcher doesn't know about this receiver yet
+                    leaving_.push(left);
+                }
+            }
+        }
+    });
+
     thread::spawn(move || {
         for m in srx.iter() {
             d.absorb(m);
@@ -1016,6 +1139,7 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
 
     Dispatcher {
         dispatcher: stx,
+        leave: ctx,
         bound: bound,
     }
 }
@@ -1078,9 +1202,9 @@ pub fn fuse<T: Clone + Send + 'static>(sources: Vec<ClockedReceiver<T>>,
 
     // create all the senders
     let mut dtxs = (0..sources.len())
-                       .into_iter()
-                       .map(|i| dtx.clone(format!("{}_to_fuse_{}", sources[i].name, i)))
-                       .collect::<Vec<_>>();
+        .into_iter()
+        .map(|i| dtx.clone(format!("{}_to_fuse_{}", sources[i].name, i)))
+        .collect::<Vec<_>>();
 
     // base receiver no longer needed
     drop(dtx);
@@ -1123,6 +1247,48 @@ mod tests {
     }
 
     #[test]
+    fn recv_drop_unblocks_sender() {
+        use std::thread;
+        use std::time::Duration;
+
+        // Create a dispatcher
+        let d = super::new(1);
+
+        // Create two channels
+        let (tx_a, rx_a) = d.new("atx", "arx");
+        let (tx_b, rx_b) = d.new("btx", "brx");
+
+        // Make tx_a a broadcaster (so it would block on b)
+        // Note that we have to do this *before* we saturate the channel to the dispatcher
+        let tx_a = tx_a.to_broadcaster();
+
+        // Fill rx_b
+        thread::spawn(move || {
+            for _ in 0..20 {
+                tx_b.send("b");
+            }
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        // Drop b's receiver
+        drop(rx_b);
+
+        // All of tx_b's sends should be dropped, and tx_a should be able to send
+        tx_a.broadcast("a");
+
+        // And that messages are still delivered
+        loop {
+            let rx = rx_a.recv();
+            assert!(rx.is_ok());
+            let rx = rx.unwrap();
+            if rx.0.is_some() {
+                assert_eq!(rx.0, Some("a"));
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn can_forward_after_recv_drop() {
         // Create a dispatcher
         let d = super::new(1);
@@ -1137,6 +1303,7 @@ mod tests {
 
         // Ensure that forwarding doesn't block forever
         tx_b.forward(Some(10), 1);
+        // note that dropping the receiver kills the senders too!
 
         // And that messages are still delivered
         assert_eq!(rx_b.recv(), Ok((Some(10), 1)));
