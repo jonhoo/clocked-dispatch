@@ -513,6 +513,8 @@ impl<T: Send + 'static> Drop for ClockedReceiver<T> {
 
         let name = mem::replace(&mut self.name, String::new());
         self.leave.send(name).unwrap();
+        // wait until we've actually been dropped
+        self.count();
     }
 }
 
@@ -1113,6 +1115,7 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
                     // the receiver exists, so we can remove it
                     let mut state = t.channel.mx.lock().unwrap();
                     state.left = true;
+                    state.closed = true;
                     t.channel.cond.notify_one();
                     drop(state);
 
