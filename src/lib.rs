@@ -614,10 +614,10 @@ impl<T: Send> Dispatcher<T> {
     /// Because the dispatcher sits between the sender and the receiver, a bound of 0 will not
     /// guarantee a "rendezvous" between the sender and the receiver, but rather between the sender
     /// and the dispatcher (and subsequently, the dispatcher and the receiver).
-    pub fn new<V: Sized + Into<String>>(&self,
-                                        sender: V,
-                                        receiver: V)
-                                        -> (ClockedSender<T>, ClockedReceiver<T>) {
+    pub fn new<S1: Into<String>, S2: Into<String>>(&self,
+                                                   sender: S1,
+                                                   receiver: S2)
+                                                   -> (ClockedSender<T>, ClockedReceiver<T>) {
         let source = sender.into();
         let target = receiver.into();
         let send = ClockedSender {

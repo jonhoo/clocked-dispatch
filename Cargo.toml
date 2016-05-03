@@ -1,6 +1,6 @@
 [package]
 name = "clocked-dispatch"
-version = "2.1.1"
+version = "2.1.2"
 
 description = "Provides a clocked message dispatch service"
 readme = "README.md"
