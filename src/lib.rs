@@ -119,7 +119,6 @@
 //! assert_eq!(rx.recv(), Ok((Some("a1"), 1)));
 //! ```
 
-extern crate time;
 extern crate rand;
 
 use std::sync::{Arc, Mutex, Condvar};
@@ -130,6 +129,7 @@ use std::collections::VecDeque;
 use std::collections::BinaryHeap;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync;
 
 macro_rules! debug {
@@ -886,7 +886,13 @@ impl<T: Clone> DispatchInner<T> {
                     self.forwarding = Some(td.ts.is_some())
                 }
 
-                let ts = td.ts.unwrap_or(time::precise_time_ns() as usize);
+                let ts = td.ts.unwrap_or_else(|| {
+                    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(dur) => dur,
+                        Err(err) => err.duration(),
+                    };
+                    (now.as_secs() as usize).wrapping_mul(1000_000_000).wrapping_add(now.subsec_nanos() as usize)
+                });
                 let min = self.min();
                 if ts <= min || td.ts.is_none() {
                     // this update doesn't need to be delayed
