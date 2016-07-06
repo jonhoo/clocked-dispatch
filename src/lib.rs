@@ -119,7 +119,6 @@
 //! assert_eq!(rx.recv(), Ok((Some("a1"), 1)));
 //! ```
 
-extern crate time;
 extern crate rand;
 
 use std::sync::{Arc, Mutex, Condvar};
@@ -129,6 +128,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::collections::BinaryHeap;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::thread;
 use std::sync;
 
@@ -141,6 +141,8 @@ macro_rules! debug {
         $(let _ = $args)*;
     };
 }
+
+static GLOBAL_SEQUENCE_NUMBER: AtomicUsize = ATOMIC_USIZE_INIT;
 
 struct TaggedData<T> {
     from: String,
@@ -886,7 +888,8 @@ impl<T: Clone> DispatchInner<T> {
                     self.forwarding = Some(td.ts.is_some())
                 }
 
-                let ts = td.ts.unwrap_or(time::precise_time_ns() as usize);
+                let ts = td.ts.unwrap_or_else(||
+                    GLOBAL_SEQUENCE_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)+1);
                 let min = self.min();
                 if ts <= min || td.ts.is_none() {
                     // this update doesn't need to be delayed
