@@ -128,7 +128,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::collections::BinaryHeap;
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::thread;
 use std::sync;
 
@@ -141,8 +140,6 @@ macro_rules! debug {
         $(let _ = $args)*;
     };
 }
-
-static GLOBAL_SEQUENCE_NUMBER: AtomicUsize = ATOMIC_USIZE_INIT;
 
 struct TaggedData<T> {
     from: String,
@@ -709,6 +706,8 @@ struct DispatchInner<T> {
     // queue bound
     bound: usize,
     id: String,
+    // Sequence number counter
+    counter: usize,
 }
 
 impl<T: Clone> DispatchInner<T> {
@@ -802,7 +801,7 @@ impl<T: Clone> DispatchInner<T> {
             // timestamp. we do this by:
             //
             // 1. finding the smallest in `bdelay`
-            let next = self.bdelay.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1);
+            let next = self.bdelay.peek().map(|d| d.ts).unwrap_or(min + 1);
             debug!("{}: next from bcast is {:?}", self.id, next);
             // 2. finding the smallest in `targets[*].delayed`
             let tnext = {
@@ -816,11 +815,11 @@ impl<T: Clone> DispatchInner<T> {
                             .lock()
                             .unwrap()
                             .peek()
-                            .and_then(|d| Some(d.ts))
+                            .map(|d| d.ts)
                             .unwrap_or(min + 1))
                     })
                     .min_by_key(|&(_, ts)| ts);
-                t.and_then(|(to, ts)| Some((to.to_owned(), ts)))
+                t.map(|(to, ts)| (to.to_owned(), ts))
             };
             debug!("{}: next from tdelay is {:?}", self.id, tnext);
             // 3. using the message from 2 if it is the earliest (and early enough)
@@ -888,8 +887,10 @@ impl<T: Clone> DispatchInner<T> {
                     self.forwarding = Some(td.ts.is_some())
                 }
 
-                let ts = td.ts.unwrap_or_else(||
-                    GLOBAL_SEQUENCE_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)+1);
+                let ts = td.ts.unwrap_or_else(|| {
+                    self.counter += 1;
+                    self.counter
+                });
                 let min = self.min();
                 if ts <= min || td.ts.is_none() {
                     // this update doesn't need to be delayed
@@ -1013,17 +1014,6 @@ impl<T: Clone> DispatchInner<T> {
     }
 }
 
-/// Set GLOBAL_SEQUENCE_NUMBER. Return old GLOBAL_SEQUENCE_NUMBER
-/// Return value should be 0
-pub fn set_sequence(state: usize) -> usize {
-    GLOBAL_SEQUENCE_NUMBER.swap(state, std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Get GLOBAL_SEQUENCE_NUMBER to facillitate persistence
-pub fn get_sequence() -> usize {
-    GLOBAL_SEQUENCE_NUMBER.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 /// Creates a new clocked dispatch. Dispatch channels can be constructed by calling `new` on the
 /// returned dispatcher.
 ///
@@ -1037,6 +1027,10 @@ pub fn get_sequence() -> usize {
 /// Be aware that a bound of 0 means that it is not safe to drop a `ClockedSender` before the
 /// corresponding `ClockedReceiver` is reading from its end of the channel.
 pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
+    new_with_seed(bound, 0)
+}
+
+pub fn new_with_seed<T: Clone + Send + 'static>(bound: usize, seed: usize) -> Dispatcher<T> {
     use rand::{thread_rng, Rng};
 
     let (stx, srx) = mpsc::sync_channel(bound);
@@ -1049,6 +1043,7 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
         forwarding: None,
         bound: bound,
         id: thread_rng().gen_ascii_chars().take(2).collect(),
+        counter: seed,
     };
 
     let id = d.id.clone();
