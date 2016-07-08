@@ -751,7 +751,7 @@ impl<T: Clone> DispatchInner<T> {
 
     /// Finds the minimum sequence number across all senders.
     fn min(&self) -> usize {
-        self.freshness.values().min().and_then(|m| Some(*m)).unwrap_or(usize::max_value() - 1)
+        self.freshness.values().min().map(|m| *m).unwrap_or(usize::max_value() - 1)
     }
 
     /// Should be called whenever the set of senders changes to process.
@@ -1011,6 +1011,17 @@ impl<T: Clone> DispatchInner<T> {
             }
         }
     }
+}
+
+/// Set GLOBAL_SEQUENCE_NUMBER. Return old GLOBAL_SEQUENCE_NUMBER
+/// Return value should be 0
+pub fn set_sequence(state: usize) -> usize {
+    GLOBAL_SEQUENCE_NUMBER.swap(state, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Get GLOBAL_SEQUENCE_NUMBER to facillitate persistence
+pub fn get_sequence() -> usize {
+    GLOBAL_SEQUENCE_NUMBER.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Creates a new clocked dispatch. Dispatch channels can be constructed by calling `new` on the
