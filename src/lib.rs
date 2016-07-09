@@ -1030,6 +1030,11 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
     new_with_seed(bound, 0)
 }
 
+/// Specifies initial counter for dispatcher. `new_with_seed(x, 0)` is equivalent to `new(x)`.
+///
+/// When a timestamp is not supplied, the dispatcher increments its counter & uses that as the
+/// sequence number. A program may maintain monotonic sequence numbers between executions by
+/// tracking those received, storing them on exit, & restoring state with `new_with_seed`.
 pub fn new_with_seed<T: Clone + Send + 'static>(bound: usize, seed: usize) -> Dispatcher<T> {
     use rand::{thread_rng, Rng};
 
