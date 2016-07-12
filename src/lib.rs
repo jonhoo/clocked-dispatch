@@ -1030,11 +1030,13 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
     new_with_seed(bound, 0)
 }
 
-/// Specifies initial counter for dispatcher. `new_with_seed(x, 0)` is equivalent to `new(x)`.
+/// Creates a new clocked dispatch whose automatically assigned sequence numbers start at a given
+/// value.
 ///
-/// When a timestamp is not supplied, the dispatcher increments its counter & uses that as the
-/// sequence number. A program may maintain monotonic sequence numbers between executions by
-/// tracking those received, storing them on exit, & restoring state with `new_with_seed`.
+/// This method is useful for programs that wish to maintain monotonic sequence numbers between
+/// multiple executions of the application. Such an application should track received sequence
+/// numbers, store the latest one upon exiting, and then use this method to resume the sequence
+/// numbers from that point onward upon resuming.
 pub fn new_with_seed<T: Clone + Send + 'static>(bound: usize, seed: usize) -> Dispatcher<T> {
     use rand::{thread_rng, Rng};
 
