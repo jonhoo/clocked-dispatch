@@ -119,7 +119,6 @@
 //! assert_eq!(rx.recv(), Ok((Some("a1"), 1)));
 //! ```
 
-extern crate time;
 extern crate rand;
 
 use std::sync::{Arc, Mutex, Condvar};
@@ -707,6 +706,8 @@ struct DispatchInner<T> {
     // queue bound
     bound: usize,
     id: String,
+    // Sequence number counter
+    counter: usize,
 }
 
 impl<T: Clone> DispatchInner<T> {
@@ -749,7 +750,7 @@ impl<T: Clone> DispatchInner<T> {
 
     /// Finds the minimum sequence number across all senders.
     fn min(&self) -> usize {
-        self.freshness.values().min().and_then(|m| Some(*m)).unwrap_or(usize::max_value() - 1)
+        self.freshness.values().min().map(|m| *m).unwrap_or(usize::max_value() - 1)
     }
 
     /// Should be called whenever the set of senders changes to process.
@@ -800,7 +801,7 @@ impl<T: Clone> DispatchInner<T> {
             // timestamp. we do this by:
             //
             // 1. finding the smallest in `bdelay`
-            let next = self.bdelay.peek().and_then(|d| Some(d.ts)).unwrap_or(min + 1);
+            let next = self.bdelay.peek().map(|d| d.ts).unwrap_or(min + 1);
             debug!("{}: next from bcast is {:?}", self.id, next);
             // 2. finding the smallest in `targets[*].delayed`
             let tnext = {
@@ -814,11 +815,11 @@ impl<T: Clone> DispatchInner<T> {
                             .lock()
                             .unwrap()
                             .peek()
-                            .and_then(|d| Some(d.ts))
+                            .map(|d| d.ts)
                             .unwrap_or(min + 1))
                     })
                     .min_by_key(|&(_, ts)| ts);
-                t.and_then(|(to, ts)| Some((to.to_owned(), ts)))
+                t.map(|(to, ts)| (to.to_owned(), ts))
             };
             debug!("{}: next from tdelay is {:?}", self.id, tnext);
             // 3. using the message from 2 if it is the earliest (and early enough)
@@ -886,7 +887,10 @@ impl<T: Clone> DispatchInner<T> {
                     self.forwarding = Some(td.ts.is_some())
                 }
 
-                let ts = td.ts.unwrap_or(time::precise_time_ns() as usize);
+                let ts = td.ts.unwrap_or_else(|| {
+                    self.counter += 1;
+                    self.counter
+                });
                 let min = self.min();
                 if ts <= min || td.ts.is_none() {
                     // this update doesn't need to be delayed
@@ -1023,6 +1027,17 @@ impl<T: Clone> DispatchInner<T> {
 /// Be aware that a bound of 0 means that it is not safe to drop a `ClockedSender` before the
 /// corresponding `ClockedReceiver` is reading from its end of the channel.
 pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
+    new_with_seed(bound, 0)
+}
+
+/// Creates a new clocked dispatch whose automatically assigned sequence numbers start at a given
+/// value.
+///
+/// This method is useful for programs that wish to maintain monotonic sequence numbers between
+/// multiple executions of the application. Such an application should track received sequence
+/// numbers, store the latest one upon exiting, and then use this method to resume the sequence
+/// numbers from that point onward upon resuming.
+pub fn new_with_seed<T: Clone + Send + 'static>(bound: usize, seed: usize) -> Dispatcher<T> {
     use rand::{thread_rng, Rng};
 
     let (stx, srx) = mpsc::sync_channel(bound);
@@ -1035,6 +1050,7 @@ pub fn new<T: Clone + Send + 'static>(bound: usize) -> Dispatcher<T> {
         forwarding: None,
         bound: bound,
         id: thread_rng().gen_ascii_chars().take(2).collect(),
+        counter: seed,
     };
 
     let id = d.id.clone();
@@ -1771,5 +1787,13 @@ mod tests {
         // dropping c should finally free up bc
         drop(c_in);
         assert_eq!(bc_in.recv(), Err(mpsc::RecvError));
+    }
+
+    #[test]
+    fn test_new_with_seed() {
+        let d = super::new_with_seed(1, 69105);
+        let (tx, rx) = d.new("tx", "rx");
+        tx.send("a");
+        assert_eq!(rx.recv(), Ok((Some("a"), 69106)));
     }
 }

@@ -16,5 +16,4 @@ keywords = ["channel","synchronization","dispatch","message"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
-time = "0.1"
 rand = "0.3"
