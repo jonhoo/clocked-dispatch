@@ -1788,4 +1788,12 @@ mod tests {
         drop(c_in);
         assert_eq!(bc_in.recv(), Err(mpsc::RecvError));
     }
+
+    #[test]
+    fn test_new_with_seed() {
+        let d = super::new_with_seed(1, 69105);
+        let (tx, rx) = d.new("tx", "rx");
+        tx.send("a");
+        assert_eq!(rx.recv(), Ok((Some("a"), 69106)));
+    }
 }
