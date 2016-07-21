@@ -137,7 +137,7 @@ macro_rules! debug {
     };
     ( $fmt:expr, $( $args:expr ),+ ) => {
         // println!($fmt, $($args),*);
-        $(let _ = $args)*;
+        $(let _ = $args;)*;
     };
 }
 
