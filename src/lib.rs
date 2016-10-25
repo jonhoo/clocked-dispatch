@@ -549,7 +549,7 @@ impl<T: Send + 'static> ClockedReceiver<T> {
         // otherwise, notify about the newest available timestamp
         state.ts_head = state.ts_tail;
         self.inner.cond.notify_one();
-        return Ok((None, state.ts_head));
+        Ok((None, state.ts_head))
     }
 
     /// Attempts to return a pending value on this receiver without blocking
@@ -582,7 +582,7 @@ impl<T: Send + 'static> ClockedReceiver<T> {
         // otherwise, notify about the newest available timestamp
         state.ts_head = state.ts_tail;
         self.inner.cond.notify_one();
-        return Ok((None, state.ts_head));
+        Ok((None, state.ts_head))
     }
 }
 
