@@ -273,7 +273,7 @@ impl<T: Clone> ClockedSender<T> {
     /// Doing so detaches the sender from its receiver, and means all future sends will be
     /// broadcast to all receivers. Note that the existence of a broadcaster prevents the closing
     /// of all channels.
-    pub fn to_broadcaster(self) -> ClockedBroadcaster<T> {
+    pub fn into_broadcaster(self) -> ClockedBroadcaster<T> {
         let dispatcher = self.dispatcher.clone();
         let source = format!("{}_bcast", self.source);
         dispatcher.send(Message::SenderJoin(None, source.clone())).unwrap();
@@ -288,7 +288,7 @@ impl<T: Clone> ClockedSender<T> {
 
 /// A sending half of a clocked synchronous channel that only allows broadcast. This half can only
 /// be owned by one thread, but it can be cloned to send to other threads. A `ClockedBroadcaster`
-/// can be constructed from a `ClockedSender` using `ClockedSender::to_broadcaster`.
+/// can be constructed from a `ClockedSender` using `ClockedSender::into_broadcaster`.
 ///
 /// Sending on a clocked channel will deliver the given message to the appropriate receiver, but
 /// also notify all other receivers about the timestamp assigned to the message. The sending will
@@ -312,7 +312,7 @@ impl<T: Clone> ClockedSender<T> {
 ///
 /// let m = clocked_dispatch::new(10);
 /// let (tx_a, rx_a) = m.new("atx", "arx");
-/// let tx = tx_a.to_broadcaster();
+/// let tx = tx_a.into_broadcaster();
 /// // note that the A channel is still open since there now exists a broadcaster,
 /// // even though all A senders have been dropped.
 ///
@@ -355,7 +355,7 @@ impl<T: Clone> ClockedSender<T> {
 /// let (tx_b, rx_b) = m.new("btx", "brx");
 /// let (tx_c, rx_c) = m.new("ctx", "crx");
 ///
-/// let tx = tx_a.to_broadcaster();
+/// let tx = tx_a.into_broadcaster();
 /// tx.broadcast_forward(Some("1"), 1);
 ///
 /// // all inputs aren't yet up-to-date to 1
@@ -1200,7 +1200,7 @@ mod tests {
 
         // Make tx_a a broadcaster (so it would block on b)
         // Note that we have to do this *before* we saturate the channel to the dispatcher
-        let tx_a = tx_a.to_broadcaster();
+        let tx_a = tx_a.into_broadcaster();
 
         // Fill rx_b
         thread::spawn(move || {
@@ -1283,7 +1283,7 @@ mod tests {
 
         let d = super::new(1);
         let (tx, rx) = d.new("tx", "rx");
-        let tx = tx.to_broadcaster();
+        let tx = tx.into_broadcaster();
 
         tx.broadcast_forward(Some("a"), 10);
         tx.broadcast_forward(Some("b"), 10);
