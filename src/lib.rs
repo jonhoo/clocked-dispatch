@@ -16,7 +16,9 @@
 //!    forwards it to the intended recipient's queue.
 //!  - In forwarding mode, it accepts timestamped messages from sources, and outputs them to the
 //!    intended recipients *in order*. Messages are buffered by the dispatcher until each of the
-//!    receiver's sources are at least as up-to-date as the message's timestamp.
+//!    receiver's sources are at least as up-to-date as the message's timestamp. These timestamps
+//!    *must* be sequentially assigned, but *may* be sent to the dispatcher in any order. The
+//!    dispatcher guarantees that they are delivered in-order.
 //!
 //! This dual-mode operation allows dispatchers to be composed in a hierarchical fashion, with a
 //! serializing dispatcher at the "top", and forwarding dispatchers "below".
@@ -358,21 +360,11 @@ impl<T: Clone> ClockedSender<T> {
 /// let tx = tx_a.into_broadcaster();
 /// tx.broadcast_forward(Some("1"), 1);
 ///
-/// // all inputs aren't yet up-to-date to 1
-/// assert_eq!(rx_a.try_recv(), Err(mpsc::TryRecvError::Empty));
-///
-/// // bring all inputs up to date
-/// tx_b.forward(None, 1);
-/// tx_c.forward(None, 1);
-///
-/// // now broadcast is delivered
 /// assert_eq!(rx_a.recv().unwrap(), (Some("1"), 1));
 /// assert_eq!(rx_b.recv().unwrap(), (Some("1"), 1));
 /// assert_eq!(rx_c.recv().unwrap(), (Some("1"), 1));
 ///
-/// // non-broadcasts still work (we still need to keep inputs up-to-date)
-/// tx.broadcast_forward(None, 2);
-/// tx_b.forward(None, 2);
+/// // non-broadcasts still work
 /// tx_c.forward(Some("c"), 2);
 /// assert_eq!(rx_a.recv().unwrap(), (None, 2));
 /// assert_eq!(rx_b.recv().unwrap(), (None, 2));
@@ -689,8 +681,6 @@ struct DispatchInner<T> {
     // per-receiver information
     // needs to be locked so that control thread can access ReceiverInner Arcs
     targets: sync::Arc<sync::RwLock<HashMap<String, Target<T>>>>,
-    // per-sender information
-    freshness: HashMap<String, usize>,
     // essentially targets.keys()
     // kept separate so we can mutably use targets while iterating over all receiver names
     destinations: HashSet<String>,
@@ -706,7 +696,9 @@ struct DispatchInner<T> {
     // queue bound
     bound: usize,
     id: String,
-    // Sequence number counter
+    // Sequence number counter.
+    // If we are in forwarding mode this is the highest consecutive sequence number we have
+    // received. If we are in serializing mode, this is the last sequence number we have assigned.
     counter: usize,
 }
 
@@ -722,21 +714,19 @@ impl<T: Clone> DispatchInner<T> {
         for (tn, t) in tgts.iter() {
             let mut state = t.channel.mx.lock().unwrap();
             debug!("{}: notifying {} about {}", self.id, tn, ts);
-            if data.is_some() {
-                if to.is_none() || to.unwrap() == tn.as_str() {
-                    debug!("{}: including data", self.id);
-                    while state.queue.len() == self.bound && !state.left {
-                        state = t.channel.cond.wait(state).unwrap();
-                    }
-
-                    if state.left {
-                        t.channel.cond.notify_one();
-                        continue;
-                    }
-
-                    // TODO: avoid clone() for the last send
-                    state.queue.push_back((data.clone().unwrap(), ts));
+            if data.is_some() && (to.is_none() || to.unwrap() == tn.as_str()) {
+                debug!("{}: including data", self.id);
+                while state.queue.len() == self.bound && !state.left {
+                    state = t.channel.cond.wait(state).unwrap();
                 }
+
+                if state.left {
+                    t.channel.cond.notify_one();
+                    continue;
+                }
+
+                // TODO: avoid clone() for the last send
+                state.queue.push_back((data.clone().unwrap(), ts));
             }
             state.ts_tail = ts;
             t.channel.cond.notify_one();
@@ -748,52 +738,12 @@ impl<T: Clone> DispatchInner<T> {
         // TODO: would be nice if we had some way of notifying the sender that this is the case
     }
 
-    /// Finds the minimum sequence number across all senders.
-    fn min(&self) -> usize {
-        self.freshness.values().min().map(|m| *m).unwrap_or(usize::max_value() - 1)
-    }
-
-    /// Should be called whenever the set of senders changes to process.
-    /// Processes delayed messages that can now be delivered, and closes channels with no senders.
-    fn senders_changed(&mut self, to: Option<String>, min_changed: bool) {
-        debug!("{}: senders for {:?} changed", self.id, to);
-
-        // if the removed sender has been delaying delivery of messages (by virtue of being the
-        // sender with the lowest sequence number), we may now be able to send some more messages.
-        // this can only happen if we're in forwarding mode, because in assignment mode, senders
-        // don't have a way to not be up-to-date, and so there are no delayed messages.
-        if self.forwarding.unwrap_or(false) && min_changed {
-            self.process_delayed();
-        }
-
-        if self.broadcasters.is_empty() {
-            // if there are broadcasters, no channel is closed
-            let mut tgts = self.targets.write().unwrap();
-            for (tn, t) in tgts.iter_mut()
-                .filter(|&(_, ref t)| {
-                    t.senders.is_empty() && t.delayed.lock().unwrap().is_empty()
-                }) {
-                debug!("{}: closing now-done channel {}", self.id, tn);
-                // having no senders when there are no broadcasters means the channel is closed
-                let mut state = t.channel.mx.lock().unwrap();
-                state.closed = true;
-                t.channel.cond.notify_one();
-                drop(state);
-            }
-        }
-    }
-
     /// Find any delayed messages that are now earlier than the minimum sender sequence number, and
     /// send them in-order. Will check both broadcast messages and messages to a given sender if
     /// `to.is_some()`.
     fn process_delayed(&mut self) {
-        let min = self.min();
-        debug!("{}: processing delayed, min is {}", self.id, min);
-
-        // keep track of the largest timestamp we notified receivers about
-        // so that we also know to update their up-to-date-ness if the min
-        // is greater than all queued messages' sequence numbers.
-        let mut forwarded = 0;
+        assert!(self.forwarding.unwrap_or(false));
+        debug!("{}: processing delayed after {}", self.id, self.counter);
 
         // keep looking for a candidate to send
         loop {
@@ -801,7 +751,7 @@ impl<T: Clone> DispatchInner<T> {
             // timestamp. we do this by:
             //
             // 1. finding the smallest in `bdelay`
-            let next = self.bdelay.peek().map(|d| d.ts).unwrap_or(min + 1);
+            let next = self.bdelay.peek().map(|d| d.ts);
             debug!("{}: next from bcast is {:?}", self.id, next);
             // 2. finding the smallest in `targets[*].delayed`
             let tnext = {
@@ -815,35 +765,39 @@ impl<T: Clone> DispatchInner<T> {
                             .lock()
                             .unwrap()
                             .peek()
-                            .map(|d| d.ts)
-                            .unwrap_or(min + 1))
+                            .map(|d| d.ts))
                     })
+                    .filter_map(|(to, ts)| ts.map(move |ts| (to, ts)))
                     .min_by_key(|&(_, ts)| ts);
                 t.map(|(to, ts)| (to.to_owned(), ts))
             };
+
             debug!("{}: next from tdelay is {:?}", self.id, tnext);
-            // 3. using the message from 2 if it is the earliest (and early enough)
+
+            // 3. using the message from 2 if it is the next message
             if let Some((to, tnext)) = tnext {
-                if tnext <= next && tnext <= min {
+                if tnext == self.counter + 1 {
                     debug!("{}: forwarding from tdelay", self.id);
                     let d = {
                         let tgts = self.targets.read().unwrap();
                         let mut x = tgts[to.as_str()].delayed.lock().unwrap();
                         x.pop().unwrap()
                     };
-                    forwarded = d.ts;
                     self.notify(Some(&to), d.ts, Some(d.data));
+                    self.counter += 1;
                     continue;
                 }
             }
 
-            // 4. using the message from 1 (which must now be the earliest) if it is early enough
-            if next <= min {
-                debug!("{}: forwarding from bdelay", self.id);
-                let d = self.bdelay.pop().unwrap();
-                forwarded = d.ts;
-                self.notify(None, d.ts, Some(d.data));
-                continue;
+            // 4. using the message from 1 if it is the next message
+            if let Some(ts) = next {
+                if ts == self.counter + 1 {
+                    debug!("{}: forwarding from bdelay", self.id);
+                    let d = self.bdelay.pop().unwrap();
+                    self.notify(None, d.ts, Some(d.data));
+                    self.counter += 1;
+                    continue;
+                }
             }
 
             // no delayed message has a sequence number <= min
@@ -851,17 +805,6 @@ impl<T: Clone> DispatchInner<T> {
         }
 
         debug!("{}: done replaying", self.id);
-
-        // make sure all dependents know how up-to-date we are
-        // even if we didn't send a delayed message for the min
-        if forwarded < min && min != usize::max_value() - 1 {
-            // if forwarded < min {
-            debug!("{}: sending notify None for {} (since > {})",
-                   self.id,
-                   min,
-                   forwarded);
-            self.notify(None, min, None);
-        }
     }
 
     /// Takes a message from any sender, handles control messages, and delays or delivers data
@@ -887,54 +830,52 @@ impl<T: Clone> DispatchInner<T> {
                     self.forwarding = Some(td.ts.is_some())
                 }
 
-                let ts = td.ts.unwrap_or_else(|| {
-                    self.counter += 1;
-                    self.counter
-                });
-                let min = self.min();
-                if ts <= min || td.ts.is_none() {
-                    // this update doesn't need to be delayed
-                    // OR
+                if let Some(ts) = td.ts {
+                    // if we are forwarding (which must be the case here), this message may be the
+                    // next to be sent out. in that case we should increase the sequence number
+                    // tracker so that any later messages will also be released
+                    assert!(ts >= self.counter);
+                    if ts == self.counter + 1 {
+                        self.counter = ts;
+                    }
+                }
+
+                if td.ts.is_none() {
                     // the sender leaves it up to us to pick timestamps, so we know we're always up
                     // to date. note that this latter case assumes that the senders will *never*
                     // give us timestamps once they have let us pick once.
-                    // XXX: is ts < min possible?
-                    self.notify(td.to.as_ref(), ts, td.data);
-                } else {
-                    // we need to buffer this update until the other views are
-                    // sufficiently up-to-date. technically, if this increments the
-                    // min, this could happen immediately, but pushing this here both
-                    // avoids duplication of code, and ensures that we process the
-                    // updates in order.
-                    if let Some(data) = td.data {
-                        if let Some(ref to) = td.to {
-                            debug!("{}: delayed in {:?}", self.id, to);
-                            let tgts = self.targets.read().unwrap();
-                            tgts[to].delayed.lock().unwrap().push(Delayed {
-                                ts: ts,
-                                data: data,
-                            });
-                            drop(tgts);
-                        } else {
-                            debug!("{}: delayed in bcast", self.id);
-                            self.bdelay.push(Delayed {
-                                ts: ts,
-                                data: data,
-                            });
-                        }
-                    }
+                    self.counter += 1;
+                    self.notify(td.to.as_ref(), self.counter, td.data);
+                    return;
+                }
 
-                    let old = self.freshness[&*td.from];
-                    if ts > old {
-                        // we increment at least one min
-                        self.freshness.insert(td.from.clone(), ts);
-                        if old == min {
-                            let nmin = self.min();
-                            // we *may* have increased the global min
-                            if nmin > old {
-                                self.process_delayed();
-                            }
-                        }
+                // we're in forwarding mode
+                let ts = td.ts.unwrap();
+                if ts == self.counter {
+                    // this messages is the next to be sent out, so we can send it immediately
+                    self.notify(td.to.as_ref(), ts, td.data);
+                    // since this messages must also have incremented the counter above, there may
+                    // be other messages that can now be sent out.
+                    self.process_delayed();
+                    return;
+                }
+
+                // need to buffer this message until the other views are sufficiently up-to-date.
+                if let Some(data) = td.data {
+                    if let Some(ref to) = td.to {
+                        debug!("{}: delayed in {:?}", self.id, to);
+                        let tgts = self.targets.read().unwrap();
+                        tgts[to].delayed.lock().unwrap().push(Delayed {
+                            ts: ts,
+                            data: data,
+                        });
+                        drop(tgts);
+                    } else {
+                        debug!("{}: delayed in bcast", self.id);
+                        self.bdelay.push(Delayed {
+                            ts: ts,
+                            data: data,
+                        });
                     }
                 }
             }
@@ -956,34 +897,16 @@ impl<T: Clone> DispatchInner<T> {
                 debug!("{}: receiver {} left", self.id, name);
                 // NOTE: Control thread has already unblocked senders and set .left
 
-                // Deregister all senders (so they don't hold sending up due to freshness)
-                let changed = {
-                    let mut tgts = self.targets.write().unwrap();
-                    let changed = {
-                        let omin = self.min();
-                        for s in tgts[&*name].senders.iter() {
-                            self.freshness.remove(s.as_str());
-                        }
-                        self.min() != omin
-                    };
-
-                    // Deregister the receiver
-                    tgts.remove(&*name);
-                    self.destinations.remove(&*name);
-                    changed
-                };
-
-                self.senders_changed(Some(name), changed);
+                // Deregister the receiver
+                let mut tgts = self.targets.write().unwrap();
+                tgts.remove(&*name);
+                self.destinations.remove(&*name);
 
                 // TODO: ensure that subsequent send()'s return an error (somehow?) instead of just
                 // crashing and burning (panic) like what happens now.
             }
             Message::SenderJoin(target, source) => {
                 debug!("{}: sender {} for {:?} joined", self.id, source, target);
-
-                if self.freshness.insert(source.clone(), 0).is_some() {
-                    panic!("sender {} already exists!", source);
-                }
 
                 if let Some(target) = target {
                     let mut tgts = self.targets.write().unwrap();
@@ -1005,10 +928,21 @@ impl<T: Clone> DispatchInner<T> {
                     self.broadcasters.remove(&*source);
                 }
 
-                let omin = self.min();
-                self.freshness.remove(&*source);
-                let nmin = self.min();
-                self.senders_changed(target, omin != nmin);
+                if self.broadcasters.is_empty() {
+                    // if there are broadcasters, no channel is closed
+                    let mut tgts = self.targets.write().unwrap();
+                    for (tn, t) in tgts.iter_mut()
+                        .filter(|&(_, ref t)| {
+                            t.senders.is_empty() && t.delayed.lock().unwrap().is_empty()
+                        }) {
+                        debug!("{}: closing now-done channel {}", self.id, tn);
+                        // having no senders when there are no broadcasters means the channel is closed
+                        let mut state = t.channel.mx.lock().unwrap();
+                        state.closed = true;
+                        t.channel.cond.notify_one();
+                        drop(state);
+                    }
+                }
             }
         }
     }
@@ -1046,7 +980,6 @@ pub fn new_with_seed<T: Clone + Send + 'static>(bound: usize, seed: usize) -> Di
         destinations: HashSet::new(),
         bdelay: BinaryHeap::new(),
         broadcasters: HashSet::new(),
-        freshness: HashMap::new(),
         forwarding: None,
         bound: bound,
         id: thread_rng().gen_ascii_chars().take(2).collect(),
@@ -1285,12 +1218,12 @@ mod tests {
         let (tx, rx) = d.new("tx", "rx");
         let tx = tx.into_broadcaster();
 
-        tx.broadcast_forward(Some("a"), 10);
-        tx.broadcast_forward(Some("b"), 10);
+        tx.broadcast_forward(Some("a"), 1);
+        tx.broadcast_forward(Some("b"), 2);
         drop(tx);
 
-        assert_eq!(rx.recv(), Ok((Some("a"), 10)));
-        assert_eq!(rx.recv(), Ok((Some("b"), 10)));
+        assert_eq!(rx.recv(), Ok((Some("a"), 1)));
+        assert_eq!(rx.recv(), Ok((Some("b"), 2)));
         assert_eq!(rx.recv(), Err(mpsc::RecvError));
     }
 
@@ -1305,25 +1238,21 @@ mod tests {
 
             let t_a = thread::spawn(move || {
                 tx_a.forward(Some("c_1"), 1);
-                tx_a.forward(None, 2); // absorbed
                 tx_a.forward(Some("c_3"), 3);
                 tx_a.forward(Some("a_1"), 5);
-                tx_a.forward(Some("a_2"), 6);
             });
             let t_b = thread::spawn(move || {
-                tx_b.forward(Some("c_1"), 1);
                 tx_b.forward(Some("c_2"), 2);
-                tx_b.forward(None, 3); // absorbed
                 tx_b.forward(Some("b_1"), 4);
-                tx_b.forward(None, 6);
+                tx_b.forward(Some("a_2"), 6);
             });
 
             assert_eq!(rx.recv(), Ok((Some("c_1"), 1)));
-            assert_eq!(rx.recv(), Ok((Some("c_1"), 1))); // received from both ins, so duped
             assert_eq!(rx.recv(), Ok((Some("c_2"), 2)));
             assert_eq!(rx.recv(), Ok((Some("c_3"), 3)));
             assert_eq!(rx.recv(), Ok((Some("b_1"), 4)));
             assert_eq!(rx.recv(), Ok((Some("a_1"), 5)));
+            assert_eq!(rx.recv(), Ok((Some("a_2"), 6)));
 
             t_a.join().unwrap();
             t_b.join().unwrap();
