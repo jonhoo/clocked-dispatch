@@ -1,19 +1,23 @@
 [package]
 name = "clocked-dispatch"
-version = "4.0.0"
+version = "4.0.1"
 
 description = "Provides a clocked message dispatch service"
 readme = "README.md"
 
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
 
-documentation = "https://jon.tsp.io/crates/clocked_dispatch"
+documentation = "https://docs.rs/clocked-dispatch"
 homepage = "https://github.com/jonhoo/clocked-dispatch"
 repository = "https://github.com/jonhoo/clocked-dispatch.git"
 
 keywords = ["channel","synchronization","dispatch","message"]
+categories = ["asynchronous", "concurrency"]
 
 license = "MIT/Apache-2.0"
+
+[badges]
+travis-ci = { repository = "jonhoo/clocked-dispatch" }
 
 [dependencies]
 rand = "0.3"
